@@ -1,8 +1,12 @@
+use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_64;
+
+pub mod logging;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SaveFileType {
@@ -90,8 +94,59 @@ pub async fn hash_file(
     Ok(hash)
 }
 
+pub fn hash_bytes(data: &[u8]) -> u64 {
+    xxh3_64(data)
+}
+
 pub fn hashes_equal(hash1: u64, hash2: u64) -> bool {
     hash1 == hash2
+}
+
+pub fn zlib_decompress(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
+}
+
+/// Size and mtime of a file, for logging. mtime answers "what touched this
+/// save?" questions that a hash alone cannot.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileStat {
+    pub size: u64,
+    pub mtime_secs: u64,
+}
+
+impl std::fmt::Display for FileStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} bytes, mtime {}",
+            self.size,
+            logging::format_unix_time(self.mtime_secs, 0)
+        )
+    }
+}
+
+pub async fn file_stat(path: &Path) -> Option<FileStat> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let mtime_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+
+    Some(FileStat {
+        size: metadata.len(),
+        mtime_secs,
+    })
+}
+
+pub fn fmt_stat_opt(stat: Option<FileStat>) -> String {
+    match stat {
+        Some(s) => s.to_string(),
+        None => "<file absent>".to_string(),
+    }
 }
 
 pub fn is_hidden_path(path: &Path) -> bool {

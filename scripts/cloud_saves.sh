@@ -415,6 +415,36 @@ def create_updates_dir_if_needed():
         os.makedirs(updates_dir)
 
 
+def _read_pid_file(pid_path):
+    """
+    Reads a pid file, tolerating it being absent or containing garbage left
+    over from an unclean shutdown.
+
+    :return: PID as integer, or 0 if there is none
+    """
+
+    if not os.path.isfile(pid_path):
+        return 0
+
+    try:
+        with open(pid_path, "r", encoding="utf-8") as pid_file:
+            return int(pid_file.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _process_is_alive(pid):
+    if pid == 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def save_client_pid():
     """
     Retrieves the PID of the running Mister Cloud Saves Client.
@@ -422,25 +452,55 @@ def save_client_pid():
     :return: PID as integer
     """
 
-    pid_path = os.path.join("/var/run", "mister_save_client.pid")
+    return _read_pid_file(os.path.join("/var/run", "mister_save_client.pid"))
 
-    if not os.path.isfile(pid_path):
-        return 0
 
-    with open(pid_path, "r", encoding="utf-8") as pid_file:
-        pid = pid_file.read().strip()
-    return int(pid)
+def supervisor_pid():
+    """
+    Retrieves the PID of the launcher's supervisor process, if the currently
+    installed launcher has one. Older launchers (before the client was
+    supervised) never write this file, so its absence is normal rather than
+    an error.
+
+    :return: PID as integer
+    """
+
+    return _read_pid_file(os.path.join("/var/run", "mister_save_client_launcher.pid"))
 
 
 def stop_client_process():
     """
-    Stops the running Mister Cloud Saves Client process.
+    Stops the running Mister Cloud Saves Client, and the supervisor that
+    would otherwise immediately restart it.
+
+    The supervisor must be stopped first: it exists specifically to bring
+    the client back if it ever exits, so signaling the client alone would
+    just have the supervisor relaunch it - possibly mid-update, racing the
+    new binary being extracted on top of the one that just got killed.
     """
 
+    sup_pid = supervisor_pid()
+    if sup_pid and _process_is_alive(sup_pid):
+        print(f"Stopping Mister Cloud Saves Client supervisor with PID {sup_pid}...")
+        try:
+            os.kill(sup_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        # Give the supervisor a moment to forward the signal to the client
+        # and exit cleanly before anything starts overwriting the binary it
+        # was running.
+        for _ in range(50):  # up to ~5s
+            if not _process_is_alive(sup_pid):
+                break
+            time.sleep(0.1)
+
     pid = save_client_pid()
-    if pid == 0:
-        print("Mister Cloud Saves Client is not running.")
+    if not _process_is_alive(pid):
+        if not sup_pid:
+            print("Mister Cloud Saves Client is not running.")
         return
+
     print(f"Stopping Mister Cloud Saves Client with PID {pid}...")
 
     try:

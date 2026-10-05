@@ -54,6 +54,17 @@ impl Database {
         Some(user_data)
     }
 
+    /// The single stored entry for one save, used to report what an upload is
+    /// about to replace.
+    pub fn get_save_file(&self, user_id: &str, core: &str, name: &str) -> Option<SaveFile> {
+        let save_key = format!("{}/{}/{}", user_id, core, name);
+
+        match self.user_saves_tree.get(save_key) {
+            Ok(Some(value)) => serde_json::from_slice(&value).ok(),
+            _ => None,
+        }
+    }
+
     pub fn set_user_save_data(&self, user_id: &str, data: &SaveFile) -> Option<bool> {
         let save_key = format!("{}/{}/{}", user_id, data.core, data.name);
 

@@ -68,6 +68,108 @@ You will also have the option to apply the same choice to all remaining conflict
 
 After the initial setup, the `mister_save_client` will automatically run in the background on MiSTer at boot and sync your save files with the cloud server.
 
+## Logs and Troubleshooting
+
+The client writes a log of everything it does to:
+
+```
+/media/fat/cloud_saves/cloud_saves.log
+```
+
+The log rotates to `cloud_saves.log.1` at 4 MiB, so it uses at most 8 MiB of
+SD card space.
+
+Every decision is recorded with the `xxh3` content hash of the file before and
+after the change, along with the reason the change was made. For example, a
+machine picking up a save made on another machine logs:
+
+```
+INFO  client: GameSave GBA/zelda.sav: content differs - local hash 889ba0dad4e3b6ec (modified_index 1) vs server hash 498b9240a4677916 (modified_index 2); server copy is newer
+INFO  client: downloading GBA/zelda.sav: replacing /media/fat/saves/GBA/zelda.sav [on disk: 31 bytes, mtime 2026-10-05T05:05:06Z, hash 889ba0dad4e3b6ec] with server copy [expected hash 498b9240a4677916, modified_index 2]; reason: server modified_index 2 >= local 1
+INFO  client: GBA/zelda.sav: wrote /media/fat/saves/GBA/zelda.sav - hash 889ba0dad4e3b6ec -> 498b9240a4677916 (41 bytes, mtime 2026-10-05T05:05:06Z), now at modified_index 2
+```
+
+Lines worth searching for when a save does not propagate as expected:
+
+| Search for | Meaning |
+| --- | --- |
+| `content changed while the client was not watching` | A file changed on disk between runs, so this machine's `modified_index` was bumped and it now claims the newest copy. |
+| `no content change` | The file was written but the bytes are identical, so nothing claims to be newer. |
+| `DIVERGENT` | Both copies changed independently and sit at the same `modified_index`. The index cannot break the tie, the server copy wins, and the local changes are lost. |
+| `does not match the save map's hash` | Something changed a save without the client noticing, and those changes are about to be overwritten. |
+| `verification FAILED` | A file did not contain what was just written to it. |
+
+The server logs the same information for every request, including what each
+upload replaces and a `CLOBBER` warning when an upload whose `modified_index`
+is not newer overwrites different content.
+
+Logging is controlled by environment variables on both the client and server:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MISTER_SAVE_LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug`. `debug` adds every raw filesystem event. |
+| `MISTER_SAVE_LOG_FILE` | client: `/media/fat/cloud_saves/cloud_saves.log`, server: unset | Log file path. Set it to an empty string to log only to stdout. |
+| `MISTER_SAVE_LOG_MAX_BYTES` | `4194304` | Rotation threshold in bytes. `0` disables rotation. |
+
+The server logs to stdout by default, so under Docker use `docker logs
+mister-saves-container`.
+
+### Boot and supervision
+
+MiSTer has no systemd (or any other service manager), so the client is
+launched by its own small supervisor, started once from
+`/media/fat/linux/user-startup.sh` at boot. The supervisor:
+
+- Waits for each save directory and for `/tmp/CORENAME` to exist before
+  watching it, since a core may not have loaded yet in the first seconds
+  after boot. If a watch is lost later for any reason, it's retried with
+  capped exponential backoff instead of staying down for the rest of the
+  session - this is logged to `cloud_saves.log` as `watch target ... does
+  not exist yet` / `... appeared after ...`.
+- Restarts the client itself if it ever exits unexpectedly (crash, unhandled
+  error), with the same kind of backoff. Supervisor activity - starts,
+  crashes, restarts - is logged separately to:
+
+  ```
+  /media/fat/cloud_saves/launcher.log
+  ```
+
+  since the client's own log only covers the client's lifetime, not whether
+  something had to restart it.
+
+Stopping the client (via the `cloud_saves` script's update/uninstall/change
+server flows) stops the supervisor first, so it doesn't simply relaunch the
+client that was just asked to stop.
+
+### Network resilience
+
+MiSTer's wifi commonly takes the better part of a minute to associate after
+boot, and can drop briefly at any point. The client handles this at a few
+levels:
+
+- At startup, it waits for the server's `/health` endpoint to respond before
+  doing anything else - this loop is unbounded (logged every 30s) since
+  there's no good alternative to waiting for the network to actually be up.
+- The sync that follows (both at startup and on each return to MENU) retries
+  on failure with capped exponential backoff - about a minute's worth of
+  attempts at startup, since the network can still be settling down for a
+  moment even after that first health check succeeds; a shorter window on
+  return to MENU, since the next visit or next local save will try again
+  regardless.
+- Every HTTP request has a bounded timeout (10s to connect, 60s overall), so
+  a connection that neither completes nor fails outright - common with a
+  flaky link - fails loudly and gets retried instead of hanging the
+  responsible watcher indefinitely.
+
+One thing this deliberately does **not** do is retry a failed sync while a
+core is actively running. A full sync can download and overwrite local save
+files, and doing that automatically while a game is mid-session is exactly
+the kind of surprise overwrite this tool tries hard to avoid elsewhere (see
+the conflict and hash logging above) - so if the startup sync exhausts its
+retries, or a session never returns to MENU, newly-downloaded saves from
+another machine won't appear until the next MENU visit. That trade-off is
+intentional.
+
 ## Updating
 
 Mister Cloud Saves is updated using the `update` or `update_all` script from the MiSTer Scripts menu.
