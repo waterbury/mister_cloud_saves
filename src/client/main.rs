@@ -95,6 +95,20 @@ struct SaveMapUpdate {
     changed: bool,
 }
 
+/// What happened when an upload was sent to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadOutcome {
+    /// The server accepted it.
+    Accepted,
+    /// The server rejected it (HTTP 409) because the claimed modified_index
+    /// wasn't newer than what it already has, yet the content differs - this
+    /// upload is not a continuation of the server's current data.
+    Conflict,
+    /// Anything else: a network error, a non-2xx/409 HTTP status, or a local
+    /// failure before the request was even sent.
+    Failed,
+}
+
 #[tokio::main]
 async fn main() {
     let arg = std::env::args().nth(1);
@@ -444,15 +458,80 @@ pub async fn handle_file_event(save_type: SaveFileType, path: PathBuf) {
     let server_url = SERVER_URL.lock().await.clone();
     let user_id = USER_ID.lock().await.clone();
 
-    upload_file(
+    let outcome = upload_file(
         path,
-        save_type,
+        save_type.clone(),
         modified_index,
         Some(&file_data),
         server_url,
         user_id,
     )
     .await;
+
+    if outcome == UploadOutcome::Conflict {
+        // The server has content for this key that this machine never
+        // synced down before writing its own - most likely an earlier sync
+        // failed (network, or the retries in sync_saves_with_retry were
+        // exhausted) and this is autosave or a manual save writing over
+        // what the user assumed was a continuation of another machine's
+        // save. Uploading now would silently destroy that machine's
+        // progress, so instead this re-fetches the server's actual current
+        // state and aligns this entry to it (keeping the real on-disk
+        // content, but matching the server's modified_index) so the next
+        // full sync sees an honest conflict - same index, different hash -
+        // and resolves it through the normal conflict path rather than one
+        // side quietly overwriting the other here.
+        log_warn!(
+            "{}: not uploaded - this change is not a continuation of the server's current \
+             data. The server's existing save is being preserved; re-fetching its current \
+             state so this is resolved as a conflict at the next sync.",
+            save_key
+        );
+
+        match get_server_data().await {
+            Ok(remote) => match category_entry(&remote, &save_type, &save_key) {
+                Some(remote_entry) => {
+                    let remote_index = remote_entry.modified_index;
+                    let remote_hash = remote_entry.hash;
+
+                    if let Some(local_entry) =
+                        category_entry_mut(&mut save_map, &save_type, &save_key)
+                    {
+                        local_entry.modified_index = remote_index;
+                    }
+
+                    log_warn!(
+                        "{}: local modified_index aligned to the server's current {} (server \
+                         hash {}, local hash {}); this machine's copy and the server's will be \
+                         compared again at the next sync",
+                        save_key,
+                        remote_index,
+                        fmt_hash(remote_hash),
+                        fmt_hash(file_hash)
+                    );
+                }
+                None => {
+                    log_warn!(
+                        "{}: server reported no entry for this key right after rejecting the \
+                         upload; leaving the save map unchanged, this will be re-evaluated next \
+                         time this file changes or a sync runs",
+                        save_key
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                log_warn!(
+                    "{}: failed to re-fetch the server's current state after the conflict \
+                     ({:?}); leaving the save map unchanged, this will be re-evaluated next \
+                     time this file changes or a sync runs",
+                    save_key,
+                    e
+                );
+                return;
+            }
+        }
+    }
 
     let json_data = match serde_json::to_vec(&save_map) {
         Ok(data) => data,
@@ -514,6 +593,35 @@ fn insert_save_data(
         previous_hash,
         previous_index,
         changed: true,
+    }
+}
+
+/// Looks up one save's entry in a `UserSaveData`'s category for `save_type`.
+fn category_entry<'a>(
+    data: &'a UserSaveData,
+    save_type: &SaveFileType,
+    save_key: &str,
+) -> Option<&'a SaveFile> {
+    match save_type {
+        SaveFileType::GameSave => data.game_saves.get(save_key),
+        SaveFileType::SaveState => data.save_states.get(save_key),
+        SaveFileType::NvRam => data.nv_ram.get(save_key),
+        SaveFileType::CoreWatch => None,
+    }
+}
+
+/// Mutable version of [`category_entry`], for adjusting a local save map
+/// entry in place.
+fn category_entry_mut<'a>(
+    data: &'a mut UserSaveData,
+    save_type: &SaveFileType,
+    save_key: &str,
+) -> Option<&'a mut SaveFile> {
+    match save_type {
+        SaveFileType::GameSave => data.game_saves.get_mut(save_key),
+        SaveFileType::SaveState => data.save_states.get_mut(save_key),
+        SaveFileType::NvRam => data.nv_ram.get_mut(save_key),
+        SaveFileType::CoreWatch => None,
     }
 }
 
@@ -758,7 +866,7 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await;
         } else {
-            upload_file(
+            let outcome = upload_file(
                 upload.request.path,
                 upload.request.save_type,
                 upload.request.modified_index,
@@ -767,6 +875,21 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 upload.request.user_id,
             )
             .await;
+
+            if outcome == UploadOutcome::Conflict {
+                // process_category already decided this upload should win
+                // based on a snapshot of the server fetched moments ago, so
+                // a rejection here means the server changed again in the
+                // meantime (a genuine race with another machine syncing
+                // concurrently) rather than anything this sync got wrong.
+                // No special recovery needed: the next sync re-fetches from
+                // scratch and will re-evaluate this key honestly.
+                log_warn!(
+                    "{}: upload rejected as a conflict - the server changed again after this \
+                     sync fetched its data; this will be re-evaluated on the next sync",
+                    upload.save_key
+                );
+            }
         }
 
         upload_pb.inc(1);
@@ -1411,14 +1534,14 @@ async fn upload_file(
     data: Option<&[u8]>,
     server_url: String,
     user_id: String,
-) {
+) -> UploadOutcome {
     let base_dir = match save_type {
         SaveFileType::GameSave => PathBuf::from("/media/fat/saves"),
         SaveFileType::SaveState => PathBuf::from("/media/fat/savestates"),
         SaveFileType::NvRam => PathBuf::from("/media/fat/config"),
         _ => {
             log_error!("Unsupported save type for upload: {:?}", save_type);
-            return;
+            return UploadOutcome::Failed;
         }
     };
 
@@ -1438,7 +1561,7 @@ async fn upload_file(
                     full_path,
                     e
                 );
-                return;
+                return UploadOutcome::Failed;
             }
         },
     };
@@ -1447,7 +1570,7 @@ async fn upload_file(
 
     if let Err(e) = zencode.write_all(&data) {
         log_error!("Failed to compress file upload {:?}: {:?}", full_path, e);
-        return;
+        return UploadOutcome::Failed;
     }
 
     let compressed_data = match zencode.finish() {
@@ -1458,7 +1581,7 @@ async fn upload_file(
                 full_path,
                 e
             );
-            return;
+            return UploadOutcome::Failed;
         }
     };
 
@@ -1466,7 +1589,7 @@ async fn upload_file(
         Some(name) => name.to_string_lossy().to_string(),
         None => {
             log_error!("Failed to get file name for {:?}", full_path);
-            return;
+            return UploadOutcome::Failed;
         }
     };
 
@@ -1474,7 +1597,7 @@ async fn upload_file(
         Some(core_name) => core_name.to_string_lossy().to_string(),
         None => {
             log_error!("Failed to get core name for {:?}", full_path);
-            return;
+            return UploadOutcome::Failed;
         }
     };
 
@@ -1482,7 +1605,7 @@ async fn upload_file(
         Ok(hash) => hash,
         Err(e) => {
             log_error!("Failed to hash file upload {:?}: {:?}", full_path, e);
-            return;
+            return UploadOutcome::Failed;
         }
     };
 
@@ -1526,16 +1649,31 @@ async fn upload_file(
                     fmt_hash(file_hash),
                     modified_index
                 );
+                UploadOutcome::Accepted
+            } else if resp.status() == reqwest::StatusCode::CONFLICT {
+                log_warn!(
+                    "server rejected {}/{} as a conflict: modified_index {} is not a \
+                     continuation of what the server currently has (hash {}). This machine's \
+                     change will not be uploaded; the server's existing copy is preserved until \
+                     this is resolved at the next full sync.",
+                    core,
+                    file_name,
+                    modified_index,
+                    fmt_hash(file_hash)
+                );
+                UploadOutcome::Conflict
             } else {
                 log_error!(
                     "Failed to upload save file {:?}: HTTP {}",
                     full_path,
                     resp.status()
                 );
+                UploadOutcome::Failed
             }
         }
         Err(e) => {
             log_error!("Failed to upload save file {:?}: {:?}", full_path, e);
+            UploadOutcome::Failed
         }
     }
 }

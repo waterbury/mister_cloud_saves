@@ -205,16 +205,30 @@ async fn upload_save(
                     _save_file.modified_index
                 );
             } else if _save_file.modified_index <= existing.modified_index {
+                // The client's claimed modified_index is the only thing
+                // establishing that its upload is a continuation of what
+                // the server already has - a client that never synced the
+                // server's current content (sync failed, or it's a machine
+                // that's never seen this save before) computes its own
+                // index purely from its own local history, with no
+                // knowledge that the server has since moved on. That can
+                // coincidentally produce a claimed index that isn't newer
+                // even though the content is a completely different,
+                // unrelated branch. Refuse rather than silently destroy the
+                // server's existing continuity - the two copies will be
+                // reconciled as a proper conflict on the next full sync
+                // instead of one quietly overwriting the other here.
                 log_warn!(
-                    "{}: CLOBBER - incoming modified_index {} is not newer than the stored {}, \
-                     yet the content differs (stored hash {}, incoming hash {}). The stored copy \
-                     is being overwritten and its contents will be lost.",
+                    "{}: REJECTED - incoming modified_index {} is not newer than the stored {}, \
+                     yet the content differs (stored hash {}, incoming hash {}). This upload is \
+                     not a continuation of the server's current data - refusing to overwrite it.",
                     save_key,
                     _save_file.modified_index,
                     existing.modified_index,
                     fmt_hash(existing.hash),
                     fmt_hash(_save_file.hash)
                 );
+                return Status::Conflict;
             }
         }
         None => {

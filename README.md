@@ -98,10 +98,44 @@ Lines worth searching for when a save does not propagate as expected:
 | `DIVERGENT` | Both copies changed independently and sit at the same `modified_index`. The index cannot break the tie, the server copy wins, and the local changes are lost. |
 | `does not match the save map's hash` | Something changed a save without the client noticing, and those changes are about to be overwritten. |
 | `verification FAILED` | A file did not contain what was just written to it. |
+| `REJECTED` (server) / `not a continuation` (client) | A write was refused because it wasn't based on the server's current data for that save - see below. |
 
 The server logs the same information for every request, including what each
-upload replaces and a `CLOBBER` warning when an upload whose `modified_index`
-is not newer overwrites different content.
+upload replaces.
+
+### Conflict protection for a machine that never synced
+
+If a machine writes a save without ever having pulled down what the server
+currently holds for it - most commonly because an earlier sync failed (see
+Network resilience below) and the user then played anyway, not realizing the
+save they loaded wasn't the latest one - that write is **not** a continuation
+of the server's data, even if it happens to be the only local history that
+machine knows about. Uploading it anyway would silently destroy whatever the
+other machine had already synced.
+
+The server refuses this: an upload is only accepted if its `modified_index`
+is strictly newer than what the server already has, whenever the content
+differs. A machine with no local record of a save computes its own index
+starting from zero, same as the very first machine to ever upload it, so a
+`REJECTED` response is a clear signal that this content is an unrelated
+branch, not stale data to be overwritten with.
+
+When the client's live file watcher gets this rejection, it does not retry
+or force the write - the server's existing save is left alone. It re-fetches
+the server's current state and aligns its own bookkeeping to it (keeping the
+file that's actually on disk, but matching the server's version number), so
+the two copies show up as a proper, honest conflict at the next sync instead
+of one silently overwriting the other. In the normal, non-interactive daemon
+mode that next sync then prefers the server's continuity automatically; the
+same conflict surfaces an explicit local/remote choice when the client is
+run interactively (see Multiple MiSTer Devices above) - and that interactive
+choice to keep local, when made deliberately, is the one case where
+overwriting the server's history is intended.
+
+This only protects against a machine that never saw the current save. It
+does not and cannot resolve two machines actively writing to the same save
+at the same time - as noted above, running the same game on two devices at
+once isn't something the tool can safely referee.
 
 Logging is controlled by environment variables on both the client and server:
 
