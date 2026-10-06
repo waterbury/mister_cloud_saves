@@ -2,6 +2,9 @@
 extern crate rocket;
 
 use rocket::State;
+use rocket::data::{Limits, ToByteUnit};
+use rocket::figment::providers::{Env, Format, Toml};
+use rocket::figment::{Figment, Profile};
 use rocket::http::Status;
 use rocket::response::status::NotFound;
 use rocket::{fs::NamedFile, serde::json::Json};
@@ -14,10 +17,13 @@ mod database;
 
 use database::Database;
 
+/// Default cap on the JSON body of an upload, in MiB.
+const MAX_UPLOAD_JSON_MIB: u64 = 256;
+
 use mister_save_utils::logging::{self, fmt_hash, fmt_hash_opt, fmt_index_opt};
 use mister_save_utils::{
     FetchSaveRequest, SaveFile, SaveFileType, UserSaveData, file_stat, fmt_stat_opt, hash_bytes,
-    hashes_equal, log_error, log_info, log_warn, zlib_decompress,
+    hashes_equal, log_debug, log_error, log_info, log_warn, zlib_decompress,
 };
 
 /// Saves are stored on the server exactly as the client sent them: zlib
@@ -438,7 +444,8 @@ async fn fetch_user_data(
         }
     };
 
-    log_info!(
+    // Every client asks for this on a timer, so it is too frequent for info.
+    log_debug!(
         "serving metadata for user {}: {} game saves, {} save states, {} nvram entries",
         user_id,
         user_save_data.game_saves.len(),
@@ -502,7 +509,32 @@ fn rocket() -> _ {
 
     let db = Arc::new(Database::new("user_saves_sled").expect("Failed to open database"));
 
-    rocket::build().manage(db).mount(
+    // The upload limit lives here rather than in Rocket.toml so it still applies
+    // when the binary is started from a directory without that file (Rocket's
+    // own default is 1 MiB). Save data travels as a JSON array of byte values,
+    // which is roughly 3.6x the size of the compressed save itself, so this
+    // allows saves of about 70 MiB compressed. Rocket.toml and ROCKET_LIMITS
+    // still override it.
+    let defaults = rocket::Config {
+        limits: Limits::default().limit("json", MAX_UPLOAD_JSON_MIB.mebibytes()),
+        ..rocket::Config::default()
+    };
+    let figment = Figment::from(defaults)
+        .merge(Toml::file(Env::var_or("ROCKET_CONFIG", "Rocket.toml")).nested())
+        .merge(Env::prefixed("ROCKET_").ignore(&["PROFILE"]).global())
+        .select(Profile::from_env_or(
+            "ROCKET_PROFILE",
+            rocket::Config::DEFAULT_PROFILE,
+        ));
+    match figment.extract_inner::<Limits>("limits") {
+        Ok(limits) => log_info!(
+            "upload body limit: {}",
+            limits.get("json").unwrap_or(Limits::JSON)
+        ),
+        Err(e) => log_warn!("could not read configured limits: {}", e),
+    }
+
+    rocket::custom(figment).manage(db).mount(
         "/",
         routes![
             generate_user_id,

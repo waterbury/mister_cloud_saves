@@ -68,6 +68,26 @@ You will also have the option to apply the same choice to all remaining conflict
 
 After the initial setup, the `mister_save_client` will automatically run in the background on MiSTer at boot and sync your save files with the cloud server.
 
+## When Saves Sync
+
+- **Uploads** happen as soon as a save file changes on the SD card.
+- **Downloads** happen at boot, on every return to the MiSTer main menu, and
+  on a background check of the server every 60 seconds, so two MiSTers that
+  are both left powered on stay in step.
+
+While a core is running, saves in that core's folder (and all arcade nvram
+files) are left alone, because the core holds the loaded game's save in memory
+and would write its stale copy back over a download. They sync on the return
+to the main menu. Saves for every other core are still downloaded.
+
+To change the interval, add this to `cloud_saves.ini`; the minimum is 10
+seconds and `0` turns the background check off:
+
+```ini
+[Sync]
+poll_interval_seconds = 60
+```
+
 ## Logs and Troubleshooting
 
 The client writes a log of everything it does to:

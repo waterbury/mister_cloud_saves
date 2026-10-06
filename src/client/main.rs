@@ -27,6 +27,29 @@ static USER_ID: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::ne
 static CURRENT_CORE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static IS_ONE_SHOT: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 static SAVE_MAP_PATH: &str = "/media/fat/cloud_saves/mister_save_map.json";
+static CORE_NAME_PATH: &str = "/tmp/CORENAME";
+
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
+const MIN_POLL_INTERVAL_SECS: u64 = 10;
+
+/// Seconds between background checks of the server for saves made on another
+/// machine. Set from `poll_interval_seconds` in the `[Sync]` section of
+/// cloud_saves.ini; 0 turns the background check off.
+static POLL_INTERVAL_SECS: LazyLock<Mutex<u64>> =
+    LazyLock::new(|| Mutex::new(DEFAULT_POLL_INTERVAL_SECS));
+
+/// Logs at info for a sync somebody triggered and at debug for a background
+/// poll, so a poll that finds nothing to do doesn't write to the SD card
+/// every minute.
+macro_rules! log_routine {
+    ($quiet:expr, $($arg:tt)*) => {
+        if $quiet {
+            log_debug!($($arg)*)
+        } else {
+            log_info!($($arg)*)
+        }
+    };
+}
 static LOG_PATH: &str = "/media/fat/cloud_saves/cloud_saves.log";
 
 /// Serializes the three places that read-modify-write the save map file
@@ -138,6 +161,7 @@ async fn main() {
     create_pid_file().await;
     clean_tmp_files().await;
     read_config().await;
+    init_current_core().await;
     wait_for_network().await;
 
     update_save_map().await;
@@ -150,6 +174,17 @@ async fn main() {
     if one_shot {
         log_info!("one-shot run finished, exiting");
         return;
+    }
+
+    let poll_interval = *POLL_INTERVAL_SECS.lock().await;
+    if poll_interval > 0 {
+        log_info!(
+            "checking the server for saves from other machines every {}s",
+            poll_interval
+        );
+        tokio::spawn(poll_server_forever(Duration::from_secs(poll_interval)));
+    } else {
+        log_info!("background server check disabled (poll_interval_seconds = 0)");
     }
 
     watch_dirs().await;
@@ -220,6 +255,123 @@ async fn read_config() {
 
     *SERVER_URL.lock().await = server_url.clone();
     *USER_ID.lock().await = user_id.clone();
+
+    let configured_interval = cloud_saves_ini
+        .get("sync")
+        .and_then(|sync_map| sync_map.get("poll_interval_seconds"))
+        .and_then(|value| value.as_deref());
+
+    if let Some(raw) = configured_interval {
+        match parse_poll_interval(raw) {
+            Some(seconds) => {
+                log_info!("config: poll_interval_seconds={}", seconds);
+                *POLL_INTERVAL_SECS.lock().await = seconds;
+            }
+            None => log_warn!(
+                "config: poll_interval_seconds={:?} is not a whole number of seconds, using the default of {}",
+                raw,
+                DEFAULT_POLL_INTERVAL_SECS
+            ),
+        }
+    }
+}
+
+/// 0 disables polling; anything else is held to a floor so a typo can't have
+/// the client hammering the server.
+fn parse_poll_interval(raw: &str) -> Option<u64> {
+    match raw.trim().parse::<u64>().ok()? {
+        0 => Some(0),
+        seconds => Some(seconds.max(MIN_POLL_INTERVAL_SECS)),
+    }
+}
+
+/// The client can start while a core is already running (the supervisor
+/// restarting it after a crash, for one), so the running core has to be read
+/// rather than assumed to be MENU.
+async fn init_current_core() {
+    if let Ok(name) = tokio::fs::read_to_string(CORE_NAME_PATH).await {
+        let name = name.trim().to_string();
+        log_info!("core at startup: {}", name);
+        *CURRENT_CORE.lock().await = name;
+    }
+}
+
+/// The core whose saves must be left alone right now, if any. A running core
+/// holds its game's save in memory and writes it back out later, so a save
+/// downloaded underneath it would be overwritten with the stale copy.
+async fn busy_core() -> Option<String> {
+    if *IS_ONE_SHOT.lock().await {
+        return None;
+    }
+
+    let core = CURRENT_CORE.lock().await.clone();
+    if core.is_empty() || core.eq_ignore_ascii_case("MENU") {
+        None
+    } else {
+        Some(core)
+    }
+}
+
+/// Whether `save_key` ("<folder>/<file>") could belong to the game loaded in
+/// `running_core`. /tmp/CORENAME names the core but not the game, and the
+/// save folder is usually but not always spelled the same as the core, so
+/// this errs towards treating a save as in use.
+fn save_in_use_by(save_type: &SaveFileType, save_key: &str, running_core: &str) -> bool {
+    // nvram files are named after the arcade set rather than filed under a
+    // core folder, so there is nothing to match the running core against.
+    if *save_type == SaveFileType::NvRam {
+        return true;
+    }
+
+    let folder = save_key.split('/').next().unwrap_or("").to_lowercase();
+    let core = running_core.to_lowercase();
+
+    if folder.is_empty() || core.is_empty() {
+        return true;
+    }
+
+    // One core can file saves under a related folder, e.g. TGFX16 and
+    // TGFX16-CD.
+    if folder.starts_with(&core) || core.starts_with(&folder) {
+        return true;
+    }
+
+    const ALIASES: [(&str, &str); 1] = [("genesis", "megadrive")];
+    ALIASES
+        .iter()
+        .any(|(a, b)| (folder == *a && core == *b) || (folder == *b && core == *a))
+}
+
+/// Picks up saves made on other machines while this one stays powered on.
+/// Without it the only chances to notice them are startup and a return to
+/// MENU.
+async fn poll_server_forever(interval: Duration) {
+    let mut failing = false;
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        match sync_saves(true).await {
+            Ok(()) => {
+                if failing {
+                    log_info!("poll: sync is working again");
+                    failing = false;
+                }
+            }
+            Err(e) => {
+                if failing {
+                    log_debug!("poll: sync still failing: {:?}", e);
+                } else {
+                    log_warn!(
+                        "poll: sync failed, retrying every {:?} (further failures are logged at debug): {:?}",
+                        interval,
+                        e
+                    );
+                    failing = true;
+                }
+            }
+        }
+    }
 }
 
 async fn clean_tmp_files() {
@@ -294,11 +446,7 @@ async fn wait_for_network() -> bool {
 }
 
 pub async fn handle_core_change_event() {
-    if CURRENT_CORE.lock().await.as_str() == "MENU" {
-        return;
-    }
-
-    let core_name_path = PathBuf::from("/tmp/CORENAME");
+    let core_name_path = PathBuf::from(CORE_NAME_PATH);
 
     let core_name = match tokio::fs::read_to_string(&core_name_path).await {
         Ok(name) => name.trim().to_string(),
@@ -312,13 +460,20 @@ pub async fn handle_core_change_event() {
         }
     };
 
-    log_info!(
-        "core changed: {} -> {}",
-        CURRENT_CORE.lock().await.clone(),
-        core_name
-    );
+    let previous_core = CURRENT_CORE.lock().await.clone();
 
-    if core_name == "MENU".to_string() {
+    // One core switch can raise several modify events.
+    if core_name == previous_core {
+        return;
+    }
+
+    log_info!("core changed: {} -> {}", previous_core, core_name);
+
+    // Recorded before syncing: the sync below leaves the running core's
+    // saves alone, and by now that is no longer the core that was just left.
+    *CURRENT_CORE.lock().await = core_name.clone();
+
+    if core_name == "MENU" {
         log_info!("returned to MENU, rescanning saves and syncing");
         update_save_map().await;
         // A short retry here covers a brief wifi blip; a longer one isn't
@@ -326,8 +481,6 @@ pub async fn handle_core_change_event() {
         // (or the next local file change) will naturally try again.
         sync_saves_with_retry(3, Duration::from_secs(2), "menu-return").await;
     }
-
-    *CURRENT_CORE.lock().await = core_name;
 }
 
 pub async fn handle_file_event(save_type: SaveFileType, path: PathBuf) {
@@ -488,7 +641,7 @@ pub async fn handle_file_event(save_type: SaveFileType, path: PathBuf) {
             save_key
         );
 
-        match get_server_data().await {
+        match get_server_data(false).await {
             Ok(remote) => match category_entry(&remote, &save_type, &save_key) {
                 Some(remote_entry) => {
                     let remote_index = remote_entry.modified_index;
@@ -625,10 +778,16 @@ fn category_entry_mut<'a>(
     }
 }
 
-async fn get_server_data() -> Result<UserSaveData, Box<dyn std::error::Error + Send + Sync>> {
+/// `quiet` is for the background poll: routine lines drop to debug, and
+/// failures are left to the caller to report so an unreachable server isn't
+/// logged as an error every interval.
+async fn get_server_data(
+    quiet: bool,
+) -> Result<UserSaveData, Box<dyn std::error::Error + Send + Sync>> {
     let server_url = SERVER_URL.lock().await.clone();
     let user_id = USER_ID.lock().await.clone();
-    log_info!(
+    log_routine!(
+        quiet,
         "fetching save metadata for user {} from {}",
         user_id,
         server_url
@@ -643,7 +802,8 @@ async fn get_server_data() -> Result<UserSaveData, Box<dyn std::error::Error + S
             if resp.status().is_success() {
                 match resp.json::<UserSaveData>().await {
                     Ok(user_data) => {
-                        log_info!(
+                        log_routine!(
+                            quiet,
                             "server reports {} game saves, {} save states, {} nvram entries",
                             user_data.game_saves.len(),
                             user_data.save_states.len(),
@@ -652,12 +812,16 @@ async fn get_server_data() -> Result<UserSaveData, Box<dyn std::error::Error + S
                         Ok(user_data)
                     }
                     Err(e) => {
-                        log_error!("failed to decode server save metadata: {:?}", e);
+                        if !quiet {
+                            log_error!("failed to decode server save metadata: {:?}", e);
+                        }
                         Err(e.into())
                     }
                 }
             } else {
-                log_error!("failed to fetch user data: HTTP {}", resp.status());
+                if !quiet {
+                    log_error!("failed to fetch user data: HTTP {}", resp.status());
+                }
                 Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("Failed to fetch user data: HTTP {}", resp.status()),
@@ -665,7 +829,9 @@ async fn get_server_data() -> Result<UserSaveData, Box<dyn std::error::Error + S
             }
         }
         Err(e) => {
-            log_error!("failed to reach server for user data: {:?}", e);
+            if !quiet {
+                log_error!("failed to reach server for user data: {:?}", e);
+            }
             Err(e.into())
         }
     }
@@ -692,7 +858,7 @@ async fn sync_saves_with_retry(
     let mut backoff = initial_backoff;
 
     for attempt in 1..=max_attempts {
-        match sync_saves().await {
+        match sync_saves(false).await {
             Ok(()) => return true,
             Err(e) => {
                 if attempt == max_attempts {
@@ -723,7 +889,9 @@ async fn sync_saves_with_retry(
     false
 }
 
-async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// `quiet` marks a background poll, which logs at info only when it finds
+/// something to do.
+async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Held across the network round-trip to the server too: a sync's
     // read-modify-write of the save map isn't done until it writes the
     // reconciled result back out, and letting a live file event interleave
@@ -731,18 +899,21 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // other's.
     let _save_map_guard = SAVE_MAP_LOCK.lock().await;
 
-    log_info!("---- starting save synchronization ----");
+    log_routine!(quiet, "---- starting save synchronization ----");
 
     let save_map_path = PathBuf::from(SAVE_MAP_PATH);
     let content = tokio::fs::read_to_string(&save_map_path).await?;
     let mut local_data: UserSaveData = serde_json::from_str(&content)?;
-    let remote_data = get_server_data().await?;
+    let saved_map = local_data.clone();
+    let remote_data = get_server_data(quiet).await?;
+    let busy_core = busy_core().await;
 
     let manage_conflicts = *IS_ONE_SHOT.lock().await;
     let server_url = SERVER_URL.lock().await.clone();
     let user_id = USER_ID.lock().await.clone();
 
-    log_info!(
+    log_routine!(
+        quiet,
         "local save map holds {} game saves, {} save states, {} nvram entries (conflict prompts {})",
         local_data.game_saves.len(),
         local_data.save_states.len(),
@@ -756,12 +927,14 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut download_tasks: Vec<DownloadTask> = Vec::new();
     let mut upload_tasks: Vec<UploadTask> = Vec::new();
+    let mut deferred = 0;
 
-    process_category(
+    deferred += process_category(
         SaveFileType::GameSave,
         &mut local_data.game_saves,
         &remote_data.game_saves,
         manage_conflicts,
+        busy_core.as_deref(),
         &mut download_tasks,
         &mut upload_tasks,
         server_url.clone(),
@@ -769,11 +942,12 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
-    process_category(
+    deferred += process_category(
         SaveFileType::SaveState,
         &mut local_data.save_states,
         &remote_data.save_states,
         manage_conflicts,
+        busy_core.as_deref(),
         &mut download_tasks,
         &mut upload_tasks,
         server_url.clone(),
@@ -781,11 +955,12 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
-    process_category(
+    deferred += process_category(
         SaveFileType::NvRam,
         &mut local_data.nv_ram,
         &remote_data.nv_ram,
         manage_conflicts,
+        busy_core.as_deref(),
         &mut download_tasks,
         &mut upload_tasks,
         server_url.clone(),
@@ -795,7 +970,19 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let total_tasks = download_tasks.len() + upload_tasks.len();
 
-    log_info!(
+    if let Some(core) = busy_core.as_deref() {
+        if deferred > 0 {
+            log_info!(
+                "{} save(s) that differ from the server are left alone while {} is running; \
+                 they sync on the return to MENU",
+                deferred,
+                core
+            );
+        }
+    }
+
+    log_routine!(
+        quiet && total_tasks == 0,
         "sync plan: {} download(s), {} upload(s)",
         download_tasks.len(),
         upload_tasks.len()
@@ -900,10 +1087,15 @@ async fn sync_saves() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     upload_pb.finish();
     total_pb.finish_with_message("Sync complete!");
 
-    let json_data = serde_json::to_vec(&local_data)?;
-    tokio::fs::write(&save_map_path, &json_data).await?;
+    // A poll that changed nothing shouldn't rewrite the map every interval:
+    // that is needless SD card wear and one more chance for a power cut to
+    // leave it truncated.
+    if local_data != saved_map {
+        let json_data = serde_json::to_vec(&local_data)?;
+        tokio::fs::write(&save_map_path, &json_data).await?;
+    }
 
-    log_info!("---- save synchronization complete ----");
+    log_routine!(quiet, "---- save synchronization complete ----");
     Ok(())
 }
 
@@ -912,12 +1104,15 @@ async fn process_category(
     local_saves: &mut HashMap<String, SaveFile>,
     remote_saves: &HashMap<String, SaveFile>,
     manage_conflicts: bool,
+    busy_core: Option<&str>,
     download_tasks: &mut Vec<DownloadTask>,
     upload_tasks: &mut Vec<UploadTask>,
     server_url: String,
     user_id: String,
-) {
+) -> usize {
     let mut conflict_state = ConflictAction::AskUser;
+    // Saves that need syncing but belong to the running core.
+    let mut deferred = 0;
 
     let all_keys: HashSet<String> = local_saves
         .keys()
@@ -936,6 +1131,26 @@ async fn process_category(
     for key in all_keys {
         let local_entry = local_saves.get(&key);
         let remote_entry = remote_saves.get(&key);
+
+        if let Some(core) = busy_core {
+            if save_in_use_by(&save_type, &key, core) {
+                let in_sync = matches!(
+                    (local_entry, remote_entry),
+                    (Some(l), Some(r))
+                        if hashes_equal(l.hash, r.hash) && l.modified_index == r.modified_index
+                );
+                if !in_sync {
+                    log_debug!(
+                        "{:?} {}: differs from the server but {} is running, leaving it for now",
+                        save_type,
+                        key,
+                        core
+                    );
+                    deferred += 1;
+                }
+                continue;
+            }
+        }
 
         match (local_entry, remote_entry) {
             (Some(local), None) => {
@@ -1202,6 +1417,8 @@ async fn process_category(
             (None, None) => unreachable!(),
         }
     }
+
+    deferred
 }
 
 fn prompt_user_conflict(
@@ -2004,5 +2221,122 @@ async fn scanned_stat(scanned_paths: &HashMap<String, PathBuf>, key: &str) -> St
     match scanned_paths.get(key) {
         Some(path) => fmt_stat_opt(file_stat(path).await),
         None => "<unknown path>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn save(core: &str, name: &str, hash: u64, modified_index: u64) -> (String, SaveFile) {
+        (
+            format!("{}/{}", core, name),
+            SaveFile {
+                name: name.to_string(),
+                save_type: SaveFileType::GameSave,
+                core: core.to_string(),
+                hash,
+                modified_index,
+                user_id: "test".to_string(),
+                data: None,
+            },
+        )
+    }
+
+    #[test]
+    fn running_core_claims_its_own_folder_only() {
+        let game = SaveFileType::GameSave;
+        assert!(save_in_use_by(&game, "MegaCD/Sonic CD (USA).sav", "MegaCD"));
+        assert!(save_in_use_by(&game, "megacd/Sonic CD (USA).sav", "MEGACD"));
+        assert!(!save_in_use_by(&game, "PSX/WipEout 3 (USA).sav", "MegaCD"));
+        assert!(!save_in_use_by(&game, "Saturn/Burning Rangers (USA).sav", "PSX"));
+    }
+
+    #[test]
+    fn running_core_claims_related_folders() {
+        let game = SaveFileType::GameSave;
+        assert!(save_in_use_by(&game, "TGFX16-CD/Ys.sav", "TGFX16"));
+        assert!(save_in_use_by(&game, "MegaDrive/Sonic.sav", "Genesis"));
+        assert!(save_in_use_by(&game, "Genesis/Sonic.sav", "MegaDrive"));
+    }
+
+    #[test]
+    fn running_core_claims_all_nvram() {
+        assert!(save_in_use_by(&SaveFileType::NvRam, "nvram/mslug.nvm", "PSX"));
+    }
+
+    #[test]
+    fn poll_interval_is_parsed_and_floored() {
+        assert_eq!(parse_poll_interval("60"), Some(60));
+        assert_eq!(parse_poll_interval(" 15 "), Some(15));
+        assert_eq!(parse_poll_interval("0"), Some(0));
+        assert_eq!(parse_poll_interval("1"), Some(MIN_POLL_INTERVAL_SECS));
+        assert_eq!(parse_poll_interval("soon"), None);
+        assert_eq!(parse_poll_interval("-5"), None);
+    }
+
+    #[tokio::test]
+    async fn sync_leaves_the_running_cores_saves_alone() {
+        let mut local: HashMap<String, SaveFile> = HashMap::from([
+            save("MegaCD", "Sonic CD (USA).sav", 1, 0),
+            save("PSX", "WipEout 3 (USA).sav", 1, 0),
+            save("Saturn", "Burning Rangers (USA).sav", 5, 3),
+        ]);
+        let remote: HashMap<String, SaveFile> = HashMap::from([
+            save("MegaCD", "Sonic CD (USA).sav", 2, 1),
+            save("PSX", "WipEout 3 (USA).sav", 2, 1),
+            save("Saturn", "Burning Rangers (USA).sav", 5, 3),
+        ]);
+        let mut downloads = Vec::new();
+        let mut uploads = Vec::new();
+
+        let deferred = process_category(
+            SaveFileType::GameSave,
+            &mut local,
+            &remote,
+            false,
+            Some("MegaCD"),
+            &mut downloads,
+            &mut uploads,
+            "http://server".to_string(),
+            "test".to_string(),
+        )
+        .await;
+
+        assert_eq!(deferred, 1);
+        assert!(uploads.is_empty());
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].save_key, "PSX/WipEout 3 (USA).sav");
+        // The map must keep describing the file that is really on disk, or
+        // the deferred save would look synced and never be fetched.
+        assert_eq!(local["MegaCD/Sonic CD (USA).sav"].hash, 1);
+        assert_eq!(local["MegaCD/Sonic CD (USA).sav"].modified_index, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_takes_everything_when_no_core_is_running() {
+        let mut local: HashMap<String, SaveFile> =
+            HashMap::from([save("MegaCD", "Sonic CD (USA).sav", 1, 0)]);
+        let remote: HashMap<String, SaveFile> =
+            HashMap::from([save("MegaCD", "Sonic CD (USA).sav", 2, 1)]);
+        let mut downloads = Vec::new();
+        let mut uploads = Vec::new();
+
+        let deferred = process_category(
+            SaveFileType::GameSave,
+            &mut local,
+            &remote,
+            false,
+            None,
+            &mut downloads,
+            &mut uploads,
+            "http://server".to_string(),
+            "test".to_string(),
+        )
+        .await;
+
+        assert_eq!(deferred, 0);
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(local["MegaCD/Sonic CD (USA).sav"].hash, 2);
     }
 }
