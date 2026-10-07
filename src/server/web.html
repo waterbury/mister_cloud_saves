@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiSTer Cloud Saves</title>
+<style>
+  :root {
+    --bg: #f5f5f2;
+    --panel: #ffffff;
+    --text: #1d1f21;
+    --muted: #666b70;
+    --line: #dcdcd6;
+    --accent: #1f6f5c;
+    --accent-text: #ffffff;
+    --warn: #a15c00;
+    --warn-bg: #fff4dd;
+    --danger: #a3271f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a;
+      --panel: #1e2125;
+      --text: #e6e6e3;
+      --muted: #9aa0a6;
+      --line: #32363b;
+      --accent: #4fb89d;
+      --accent-text: #10201c;
+      --warn: #f0b354;
+      --warn-bg: #33290f;
+      --danger: #f0807a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 16px 16px 64px; }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+    padding: 8px 0 16px;
+  }
+  header h1 { font-size: 20px; margin: 0; flex: 1 1 auto; }
+  h2 { font-size: 16px; margin: 32px 0 8px; }
+  h2 .count { color: var(--muted); font-weight: normal; }
+  p { margin: 8px 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 16px; margin: 8px 0;
+  }
+  .conflict { border-left: 4px solid var(--warn); }
+  .conflict h3 { margin: 0 0 4px; font-size: 16px; overflow-wrap: anywhere; }
+  .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
+  @media (max-width: 620px) { .sides { grid-template-columns: 1fr; } }
+  .side { border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+  .side h4 { margin: 0 0 6px; font-size: 14px; }
+  .side dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+  .side dt { color: var(--muted); }
+  .side dd { margin: 0; overflow-wrap: anywhere; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  button, .button {
+    font: inherit; cursor: pointer; border-radius: 6px; padding: 6px 12px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    text-decoration: none; display: inline-block;
+  }
+  button:hover, .button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  button.link { border: 0; padding: 0; background: none; color: var(--accent); text-decoration: underline; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input[type=text], input[type=search] {
+    font: inherit; padding: 6px 10px; border-radius: 6px; width: 100%;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  }
+  .badge {
+    display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .note { background: var(--warn-bg); color: var(--warn); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+  .error { color: var(--danger); }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: normal; font-size: 13px; }
+  td.name { overflow-wrap: anywhere; min-width: 180px; }
+  td.act { white-space: nowrap; text-align: right; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .row .grow { flex: 1 1 200px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>MiSTer Cloud Saves</h1>
+    <span id="who" class="muted small" hidden></span>
+    <button id="refresh" hidden>Refresh</button>
+    <button id="logout" hidden>Switch user</button>
+  </header>
+
+  <section id="login" class="panel" hidden>
+    <form id="login-form">
+      <p><label for="user-id">User ID</label></p>
+      <div class="row">
+        <input class="grow mono" id="user-id" type="text" autocomplete="off" spellcheck="false"
+               placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+        <button class="primary" type="submit">Open</button>
+      </div>
+      <p class="muted small">It is the <code>user_id</code> line in <code>cloud_saves.ini</code>
+        at the root of your MiSTer's SD card. Anyone who has it can manage these saves.</p>
+      <p id="login-error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <p id="status" class="error" hidden></p>
+
+    <section>
+      <h2>Needs a decision <span class="count" id="quarantine-count"></span></h2>
+      <div id="quarantine"></div>
+    </section>
+
+    <section id="overrides-section" hidden>
+      <h2>Waiting on a MiSTer</h2>
+      <div id="overrides" class="panel"></div>
+    </section>
+
+    <section id="no-sync-section" hidden>
+      <h2>Not syncing <span class="count" id="no-sync-count"></span></h2>
+      <div class="panel table-wrap"><table><tbody id="no-sync"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>MiSTers</h2>
+      <div class="panel table-wrap"><table><tbody id="devices"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>All saves <span class="count" id="saves-count"></span></h2>
+      <input id="filter" type="search" placeholder="Filter by core or name">
+      <div class="panel table-wrap">
+        <table>
+          <thead><tr><th>Core</th><th>Save</th><th>Last changed</th><th></th></tr></thead>
+          <tbody id="saves"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var STORAGE_KEY = "mister_cloud_saves_user";
+  var REFRESH_MS = 20000;
+  var MAX_ROWS = 300;
+
+  var userId = "";
+  var data = null;
+  var busy = false;
+  var timer = null;
+
+  function $(id) { return document.getElementById(id); }
+
+  // Everything shown comes from save and device names, so it is only ever
+  // added as text nodes.
+  function el(tag, props, children) {
+    var node = document.createElement(tag);
+    Object.keys(props || {}).forEach(function (key) {
+      if (key === "class") node.className = props[key];
+      else if (key === "onclick") node.addEventListener("click", props[key]);
+      else node.setAttribute(key, props[key]);
+    });
+    (children || []).forEach(function (child) {
+      if (child === null || child === undefined) return;
+      node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+    });
+    return node;
+  }
+
+  function remember(id) {
+    try {
+      if (id) localStorage.setItem(STORAGE_KEY, id);
+      else localStorage.removeItem(STORAGE_KEY);
+    } catch (e) { /* private window: the URL still carries it */ }
+  }
+
+  function recall() {
+    var fromUrl = decodeURIComponent(location.hash.replace(/^#/, "")).trim();
+    if (fromUrl) return fromUrl;
+    try { return localStorage.getItem(STORAGE_KEY) || ""; } catch (e) { return ""; }
+  }
+
+  function ago(seconds) {
+    if (!seconds) return "unknown";
+    var delta = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+    if (delta < 60) return "just now";
+    if (delta < 3600) return Math.floor(delta / 60) + " min ago";
+    if (delta < 86400) return Math.floor(delta / 3600) + " h ago";
+    return Math.floor(delta / 86400) + " d ago";
+  }
+
+  function when(seconds) {
+    if (!seconds) return el("span", {}, ["unknown"]);
+    return el("span", { title: new Date(seconds * 1000).toLocaleString() }, [ago(seconds)]);
+  }
+
+  function size(bytes) {
+    if (bytes === null || bytes === undefined) return "unknown";
+    if (bytes < 1024) return bytes + " bytes";
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / 1048576).toFixed(1) + " MB";
+  }
+
+  function typeLabel(type) {
+    return { GameSave: "save", SaveState: "save state", NvRam: "nvram" }[type] || type;
+  }
+
+  function api(path, body) {
+    var options = body === undefined ? {} : {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    };
+    return fetch("/api/" + encodeURIComponent(userId) + path, options);
+  }
+
+  function downloadUrl(save, deviceId) {
+    var url = "/api/" + encodeURIComponent(userId) + "/download?core=" +
+      encodeURIComponent(save.core) + "&name=" + encodeURIComponent(save.name);
+    return deviceId ? url + "&device=" + encodeURIComponent(deviceId) : url;
+  }
+
+  function showStatus(message) {
+    $("status").textContent = message || "";
+    $("status").hidden = !message;
+  }
+
+  function act(path, body, question) {
+    if (busy || (question && !confirm(question))) return;
+    busy = true;
+    api(path, body).then(function (response) {
+      busy = false;
+      showStatus(response.ok ? "" : "That did not go through (HTTP " + response.status + ").");
+      return load();
+    }).catch(function () {
+      busy = false;
+      showStatus("Could not reach the server.");
+    });
+  }
+
+  function stopSyncing(save) {
+    act("/no_sync",
+      { core: save.core, name: save.name, save_type: save.save_type, enabled: true },
+      "Stop syncing " + save.core + " / " + save.name + "?\n\n" +
+      "No MiSTer will upload or download it from now on. Each keeps the copy it has. " +
+      "Any copy of it held here for a decision is deleted from the server.");
+  }
+
+  function field(label, value) {
+    return [el("dt", {}, [label]), el("dd", {}, [value])];
+  }
+
+  function side(title, rows, href) {
+    var list = el("dl", {}, []);
+    rows.forEach(function (pair) {
+      pair.forEach(function (node) { list.appendChild(node); });
+    });
+    return el("div", { class: "side" }, [
+      el("h4", {}, [title]),
+      list,
+      el("p", {}, [el("a", { href: href, class: "small" }, ["Download this copy"])])
+    ]);
+  }
+
+  function conflictCard(q) {
+    var who = q.device_name;
+    var sameSize = q.current_size !== null && q.current_size === q.size;
+
+    var current = q.current ? side("Current save, on every other MiSTer", [
+      field("Last changed", when(q.current.updated_at)),
+      field("By", q.current.updated_by || "unknown"),
+      field("Size", size(q.current_size)),
+      field("Fingerprint", el("span", { class: "mono" }, [q.current.hash]))
+    ], downloadUrl(q)) : el("div", { class: "side muted" }, ["The server has no current copy."]);
+
+    var held = side("Held copy, from " + who, [
+      field("Last changed", when(q.updated_at)),
+      field("Conflict began", when(q.first_at)),
+      field("Size", size(q.size)),
+      field("Fingerprint", el("span", { class: "mono" }, [q.hash]))
+    ], downloadUrl(q, q.device_id));
+
+    return el("div", { class: "panel conflict" }, [
+      el("h3", {}, [q.core + " / " + q.name]),
+      el("p", { class: "muted small" }, [
+        el("span", { class: "badge" }, [typeLabel(q.save_type)]),
+        " " + who + " changed this save without having the current one first. " +
+        "Its copy is held here and nothing has changed on any MiSTer. " + who +
+        " keeps playing on its own copy until you decide." +
+        (sameSize ? "" : " The two copies differ in size.")
+      ]),
+      el("div", { class: "sides" }, [current, held]),
+      el("div", { class: "actions" }, [
+        el("button", { class: "primary", onclick: function () {
+          act("/quarantine/promote", { core: q.core, name: q.name, device_id: q.device_id },
+            "Use " + who + "'s copy of " + q.core + " / " + q.name + " everywhere?\n\n" +
+            "It becomes the current save and every other MiSTer downloads it, " +
+            "replacing the current one. This cannot be undone.");
+        } }, ["Use " + who + "'s copy everywhere"]),
+        el("button", { class: "danger", onclick: function () {
+          act("/quarantine/discard", { core: q.core, name: q.name, device_id: q.device_id },
+            "Discard " + who + "'s copy of " + q.core + " / " + q.name + "?\n\n" +
+            "The held copy is deleted, and " + who + " replaces whatever it has for this " +
+            "save with the current one the next time it syncs, including anything it " +
+            "saved in the meantime. This cannot be undone.");
+        } }, ["Discard it, keep the current save"]),
+        el("button", { onclick: function () { stopSyncing(q); } }, ["Stop syncing this save"])
+      ])
+    ]);
+  }
+
+  function render() {
+    var box = $("quarantine");
+    box.replaceChildren();
+    $("quarantine-count").textContent = data.quarantine.length ? "(" + data.quarantine.length + ")" : "";
+    document.title = (data.quarantine.length ? "(" + data.quarantine.length + ") " : "") + "MiSTer Cloud Saves";
+    if (!data.quarantine.length) {
+      box.appendChild(el("div", { class: "panel muted" }, ["No conflicts. Nothing is waiting on you."]));
+    }
+    data.quarantine.forEach(function (q) { box.appendChild(conflictCard(q)); });
+
+    $("overrides-section").hidden = !data.overrides.length;
+    $("overrides").replaceChildren.apply($("overrides"), data.overrides.map(function (o) {
+      return el("p", {}, [
+        o.device_name + " will replace its copy of " + o.core + " / " + o.name +
+        " with the current save the next time it syncs (decided ", when(o.at), ")."
+      ]);
+    }));
+
+    $("no-sync-section").hidden = !data.no_sync.length;
+    $("no-sync-count").textContent = "(" + data.no_sync.length + ")";
+    $("no-sync").replaceChildren.apply($("no-sync"), data.no_sync.map(function (n) {
+      return el("tr", {}, [
+        el("td", {}, [n.core]),
+        el("td", { class: "name" }, [n.name]),
+        el("td", { class: "muted" }, ["since ", when(n.at)]),
+        el("td", { class: "act" }, [el("button", { onclick: function () {
+          act("/no_sync", { core: n.core, name: n.name, save_type: n.save_type, enabled: false },
+            "Resume syncing " + n.core + " / " + n.name + "?\n\n" +
+            "A MiSTer whose copy differs from the server's will show up under " +
+            "\"Needs a decision\" rather than being overwritten.");
+        } }, ["Resume syncing"])])
+      ]);
+    }));
+
+    var devices = $("devices");
+    devices.replaceChildren();
+    if (!data.devices.length) {
+      devices.appendChild(el("tr", {}, [el("td", { class: "muted" }, [
+        "No MiSTer has checked in yet. They appear here once they run a client that supports this page."
+      ])]));
+    }
+    data.devices.forEach(function (d) {
+      devices.appendChild(el("tr", {}, [
+        el("td", { class: "name" }, [d.name]),
+        el("td", { class: "muted" }, ["last seen ", when(d.last_seen)]),
+        el("td", { class: "act" }, [el("button", { onclick: function () {
+          var name = prompt("Name for this MiSTer", d.name);
+          if (name !== null) act("/device", { device_id: d.id, name: name });
+        } }, ["Rename"])])
+      ]));
+    });
+
+    renderSaves();
+  }
+
+  function renderSaves() {
+    var needle = $("filter").value.trim().toLowerCase();
+    var rows = data.saves.filter(function (s) {
+      return !needle || (s.core + " " + s.name).toLowerCase().indexOf(needle) !== -1;
+    });
+    $("saves-count").textContent = "(" + data.saves.length + ")";
+
+    var body = $("saves");
+    body.replaceChildren();
+    rows.slice(0, MAX_ROWS).forEach(function (s) {
+      body.appendChild(el("tr", {}, [
+        el("td", {}, [s.core]),
+        el("td", { class: "name" }, [
+          el("a", { href: downloadUrl(s) }, [s.name]),
+          s.save_type === "GameSave" ? null : " ",
+          s.save_type === "GameSave" ? null : el("span", { class: "badge" }, [typeLabel(s.save_type)])
+        ]),
+        el("td", { class: "muted" }, s.updated_at
+          ? [when(s.updated_at), s.updated_by ? " by " + s.updated_by : ""]
+          : [""]),
+        el("td", { class: "act" }, [s.no_sync
+          ? el("span", { class: "badge" }, ["not syncing"])
+          : el("button", { onclick: function () { stopSyncing(s); } }, ["Stop syncing"])])
+      ]));
+    });
+    if (rows.length > MAX_ROWS) {
+      body.appendChild(el("tr", {}, [el("td", { colspan: "4", class: "muted" }, [
+        "Showing the first " + MAX_ROWS + " of " + rows.length + ". Filter to narrow it down."
+      ])]));
+    }
+    if (!rows.length) {
+      body.appendChild(el("tr", {}, [el("td", { colspan: "4", class: "muted" }, [
+        data.saves.length ? "Nothing matches." : "No saves on the server yet."
+      ])]));
+    }
+  }
+
+  function load() {
+    return api("/overview").then(function (response) {
+      if (response.status === 404) {
+        signOut("The server does not know that user ID.");
+        return;
+      }
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      return response.json().then(function (json) {
+        data = json;
+        showStatus("");
+        $("login").hidden = true;
+        $("app").hidden = false;
+        $("refresh").hidden = false;
+        $("logout").hidden = false;
+        $("who").hidden = false;
+        $("who").textContent = "user " + userId.slice(0, 8) + "…";
+        render();
+      });
+    }).catch(function () {
+      if (data) showStatus("Could not reach the server. Showing what was loaded last.");
+      else signOut("Could not reach the server.");
+    });
+  }
+
+  function signIn(id) {
+    userId = id.trim();
+    if (!userId) return;
+    remember(userId);
+    history.replaceState(null, "", "#" + encodeURIComponent(userId));
+    load();
+    clearInterval(timer);
+    timer = setInterval(function () {
+      if (!document.hidden && !busy && userId) load();
+    }, REFRESH_MS);
+  }
+
+  function signOut(message) {
+    clearInterval(timer);
+    userId = "";
+    data = null;
+    remember("");
+    history.replaceState(null, "", location.pathname);
+    ["app", "refresh", "logout", "who"].forEach(function (id) { $(id).hidden = true; });
+    $("login").hidden = false;
+    $("login-error").textContent = message || "";
+    $("login-error").hidden = !message;
+    $("user-id").focus();
+  }
+
+  $("login-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    signIn($("user-id").value);
+  });
+  $("logout").addEventListener("click", function () { signOut(""); });
+  $("refresh").addEventListener("click", function () { load(); });
+  $("filter").addEventListener("input", function () { if (data) renderSaves(); });
+
+  var known = recall();
+  if (known) signIn(known);
+  else signOut("");
+})();
+</script>
+</body>
+</html>

@@ -10,7 +10,8 @@ A utility to sync MiSTer FPGA save files with a cloud server.
 - Uses inotify and file hashing to detect changes
 - Compression to reduce bandwidth usage
 - Core agnostic - works with any MiSTer core that uses save files
-- Conflict resolution for multiple devices
+- Conflict resolution for multiple devices: a conflicting save is held in quarantine, not overwritten, until you decide on a web page
+- Per-save opt out of syncing
 
 ## Installation
 
@@ -57,12 +58,13 @@ You can choose to:
 
 - Keep the **local** version
 - Keep the **server** version
+- **Quarantine** it: keep both and decide later on the web page (see Conflicts and the Web Page below)
 
 If you choose to keep the local version, it will be uploaded to the server and overwrite the existing server file. This updated version will then be synced to all other devices during their next sync.
 
-You will also have the option to apply the same choice to all remaining conflicts.
+You will also have the option to apply the same local or server choice to all remaining conflicts.
 
-> ⚠️ **Important:** If you play the same game on multiple MiSTer devices at the same time, save data could be **overwritten**. Always make sure only one device is actively playing or saving a game at a time to avoid conflicts.
+> ⚠️ **Important:** If you play the same game on multiple MiSTer devices at the same time, only one of them is continuing the shared save. The other's progress is not lost, but it is held in quarantine until you choose between the two on the web page.
 
 ## Usage
 
@@ -87,6 +89,72 @@ seconds and `0` turns the background check off:
 [Sync]
 poll_interval_seconds = 60
 ```
+
+## Conflicts and the Web Page
+
+Open the server's address in a browser (for example `http://your-server:8000/`)
+and enter your user ID, the `user_id` line in `cloud_saves.ini`. The page can
+be bookmarked once it is open. There are no separate accounts: as with the
+MiSTers themselves, whoever has the user ID can manage the saves, so don't
+expose the server to the internet without something in front of it.
+
+### What counts as a conflict
+
+Every MiSTer remembers, for each save, the content it last exchanged with the
+server. When it uploads a change it says which content the change was made
+from, and the server takes the upload as the new current save only if that is
+the content it currently has. An upload made from anything else - an older
+copy, because another MiSTer saved in the meantime, or a copy that was never
+synced at all - is a **conflict**.
+
+A conflicting save is not rejected and does not overwrite anything. The server
+holds it in **quarantine**:
+
+- The current save, and every other MiSTer, are untouched.
+- The MiSTer that sent it keeps its own file and keeps playing on it. Each
+  further change it makes replaces its quarantined copy, so quarantine always
+  holds that MiSTer's latest.
+- It stays that way until you decide on the web page.
+
+In the other direction, a MiSTer only downloads over a save it has not changed
+since it last synced. One it has changed goes to quarantine instead.
+
+### Deciding
+
+Each conflict is listed under **Needs a decision** with both copies side by
+side - which MiSTer each came from, when it last changed, its size - and a
+link to download either one first. There are three choices:
+
+| Choice | What happens |
+| --- | --- |
+| **Use that MiSTer's copy everywhere** | The quarantined copy becomes the current save. Every other MiSTer downloads it at its next sync. |
+| **Discard it, keep the current save** | The quarantined copy is deleted, and that MiSTer is made to replace its file with the current save at its next sync - including anything newer it saved in the meantime, even if it was powered off when you decided. |
+| **Stop syncing this save** | No MiSTer uploads or downloads this save any more. Each keeps the copy it has. |
+
+The first two cannot be undone, so download a copy first if in doubt.
+
+Any save can be set not to sync from the **All saves** list, conflict or not,
+and resumed from the **Not syncing** list. When syncing resumes, a MiSTer whose
+copy differs from the server's shows up as a conflict rather than being
+overwritten.
+
+Each MiSTer appears under **MiSTers** as `MiSTer-xxxx` the first time it syncs;
+rename them there so conflicts say "Living room" rather than an id. A MiSTer is
+identified by `/media/fat/cloud_saves/device_id`, which the client creates. If
+you clone an SD card to a second MiSTer, delete that file on the copy.
+
+### Upgrading
+
+Update the server first, then each MiSTer. The pieces work together across
+versions, with the old behavior wherever one side is old:
+
+- An older client still works against the new server but is not shown on the
+  page, and its conflicts are settled the old way: the higher `modified_index`
+  wins, and an upload that isn't higher is refused.
+- A new client against an older server falls back to the same rule.
+- The first sync after a MiSTer is updated settles saves it has no history for
+  by `modified_index` one last time, as the old client would have, so updating
+  does not by itself fill the page with conflicts.
 
 ## Logs and Troubleshooting
 
@@ -115,47 +183,17 @@ Lines worth searching for when a save does not propagate as expected:
 | --- | --- |
 | `content changed while the client was not watching` | A file changed on disk between runs, so this machine's `modified_index` was bumped and it now claims the newest copy. |
 | `no content change` | The file was written but the bytes are identical, so nothing claims to be newer. |
-| `DIVERGENT` | Both copies changed independently and sit at the same `modified_index`. The index cannot break the tie, the server copy wins, and the local changes are lost. |
+| `CONFLICT` | The local and server copies both changed. The local file is kept and sent to quarantine; see Conflicts and the Web Page below. |
+| `held in quarantine` / `quarantined` | The server is holding this machine's copy for a decision on the web page. |
+| `was discarded in the web interface` | This machine's copy was discarded on the web page and is being replaced with the server's. |
+| `set not to sync` | The save was excluded from syncing on the web page. |
+| `DIVERGENT` | Only against a server without quarantine: both copies changed independently and sit at the same `modified_index`. The server copy wins and the local changes are lost. |
 | `does not match the save map's hash` | Something changed a save without the client noticing, and those changes are about to be overwritten. |
 | `verification FAILED` | A file did not contain what was just written to it. |
-| `REJECTED` (server) / `not a continuation` (client) | A write was refused because it wasn't based on the server's current data for that save - see below. |
+| `REJECTED` (server) / `not a continuation` (client) | A write was refused: it came from a client too old to have its copy quarantined, or from a machine that has been told to take the server's copy and hasn't yet. |
 
 The server logs the same information for every request, including what each
 upload replaces.
-
-### Conflict protection for a machine that never synced
-
-If a machine writes a save without ever having pulled down what the server
-currently holds for it - most commonly because an earlier sync failed (see
-Network resilience below) and the user then played anyway, not realizing the
-save they loaded wasn't the latest one - that write is **not** a continuation
-of the server's data, even if it happens to be the only local history that
-machine knows about. Uploading it anyway would silently destroy whatever the
-other machine had already synced.
-
-The server refuses this: an upload is only accepted if its `modified_index`
-is strictly newer than what the server already has, whenever the content
-differs. A machine with no local record of a save computes its own index
-starting from zero, same as the very first machine to ever upload it, so a
-`REJECTED` response is a clear signal that this content is an unrelated
-branch, not stale data to be overwritten with.
-
-When the client's live file watcher gets this rejection, it does not retry
-or force the write - the server's existing save is left alone. It re-fetches
-the server's current state and aligns its own bookkeeping to it (keeping the
-file that's actually on disk, but matching the server's version number), so
-the two copies show up as a proper, honest conflict at the next sync instead
-of one silently overwriting the other. In the normal, non-interactive daemon
-mode that next sync then prefers the server's continuity automatically; the
-same conflict surfaces an explicit local/remote choice when the client is
-run interactively (see Multiple MiSTer Devices above) - and that interactive
-choice to keep local, when made deliberately, is the one case where
-overwriting the server's history is intended.
-
-This only protects against a machine that never saw the current save. It
-does not and cannot resolve two machines actively writing to the same save
-at the same time - as noted above, running the same game on two devices at
-once isn't something the tool can safely referee.
 
 Logging is controlled by environment variables on both the client and server:
 

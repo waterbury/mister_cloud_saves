@@ -8,16 +8,17 @@ use std::{
     io::Write,
     path::PathBuf,
     process,
-    sync::LazyLock,
+    sync::{LazyLock, OnceLock},
     time::Duration,
 };
 use tokio::sync::Mutex;
 
 use mister_save_utils::logging::{self, fmt_hash, fmt_hash_opt, fmt_index_opt};
 use mister_save_utils::{
-    ConflictAction, FetchSaveRequest, SaveFile, SaveFileType, UploadSaveRequest, UserSaveData,
-    file_stat, fmt_stat_opt, hash_file, hashes_equal, is_hidden_path, log_debug, log_error,
-    log_info, log_warn, read_file_to_bytes, zlib_decompress,
+    ConflictAction, DEVICE_ID_HEADER, FetchSaveRequest, SAVE_MAP_VERSION, SaveFile, SaveFileType,
+    SaveRef, ServerState, UploadSaveRequest, UserSaveData, file_stat, fmt_stat_opt, hash_file,
+    hashes_equal, is_hidden_path, log_debug, log_error, log_info, log_warn, read_file_to_bytes,
+    zlib_decompress,
 };
 mod inotify_watcher;
 use inotify_watcher::*;
@@ -28,6 +29,20 @@ static CURRENT_CORE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(Strin
 static IS_ONE_SHOT: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 static SAVE_MAP_PATH: &str = "/media/fat/cloud_saves/mister_save_map.json";
 static CORE_NAME_PATH: &str = "/tmp/CORENAME";
+/// Kept out of cloud_saves.ini, which is copied from one MiSTer to the next.
+static DEVICE_ID_PATH: &str = "/media/fat/cloud_saves/device_id";
+
+/// Names this machine to the server, so a conflicting save can be held in
+/// quarantine for it and decisions made in the web interface can be
+/// addressed to it. Sent as a header on every request.
+static DEVICE_ID: OnceLock<String> = OnceLock::new();
+
+/// One save, as (type, "<folder>/<file>").
+type SaveId = (SaveFileType, String);
+
+/// Saves the server said not to sync, as of the last metadata fetch. Lets a
+/// live file event skip the upload without asking the server each time.
+static NO_SYNC: LazyLock<Mutex<HashSet<SaveId>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 const MIN_POLL_INTERVAL_SECS: u64 = 10;
@@ -68,7 +83,18 @@ static SAVE_MAP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// generous but finite timeout turns that into a normal, logged failure
 /// that the caller's own retry logic can act on.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(id) = DEVICE_ID.get() {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(DEVICE_ID_HEADER.as_bytes()),
+            reqwest::header::HeaderValue::from_str(id),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+
     reqwest::Client::builder()
+        .default_headers(headers)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
         .build()
@@ -87,6 +113,12 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 struct DownloadTask {
     request: FetchSaveRequest,
     save_key: String,
+    /// The server's entry, which becomes the save map's once the file is
+    /// actually on disk.
+    remote: SaveFile,
+    /// The server asked for this download to replace whatever this machine
+    /// holds, and wants to hear once it has.
+    ack_override: bool,
     /// Hash the server's metadata claims for this save.
     expected_hash: u64,
     /// Hash the save map had for the local copy we are about to replace.
@@ -103,6 +135,9 @@ struct UploadTask {
     remote_hash: Option<u64>,
     remote_index: Option<u64>,
     reason: String,
+    /// The content this upload claims to be derived from. The server makes
+    /// the upload its current save only if that is what it has.
+    base_hash: Option<u64>,
     /// True when the local and remote content hashes are already known to
     /// match (the save map was just refreshed by a scan) and only
     /// modified_index needs to move forward. Lets the upload skip resending
@@ -115,14 +150,22 @@ struct SaveMapUpdate {
     modified_index: u64,
     previous_hash: Option<u64>,
     previous_index: Option<u64>,
+    /// The entry's base_hash, which a content change leaves as it was.
+    base_hash: Option<u64>,
     changed: bool,
 }
 
 /// What happened when an upload was sent to the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadOutcome {
-    /// The server accepted it.
+    /// The server accepted it as the current save.
     Accepted,
+    /// The server kept it, but apart from the current save (HTTP 202): it
+    /// conflicts, and waits in quarantine for a decision in the web
+    /// interface. This machine carries on with its own copy meanwhile.
+    Quarantined,
+    /// The server refused it because this save is set not to sync (HTTP 423).
+    NoSync,
     /// The server rejected it (HTTP 409) because the claimed modified_index
     /// wasn't newer than what it already has, yet the content differs - this
     /// upload is not a continuation of the server's current data.
@@ -161,6 +204,7 @@ async fn main() {
     create_pid_file().await;
     clean_tmp_files().await;
     read_config().await;
+    init_device_id().await;
     init_current_core().await;
     wait_for_network().await;
 
@@ -283,6 +327,39 @@ fn parse_poll_interval(raw: &str) -> Option<u64> {
         0 => Some(0),
         seconds => Some(seconds.max(MIN_POLL_INTERVAL_SECS)),
     }
+}
+
+fn valid_device_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Reads this machine's id, making one up the first time. Must run before
+/// the first request: the HTTP client picks the id up when it is built.
+async fn init_device_id() {
+    let stored = tokio::fs::read_to_string(DEVICE_ID_PATH)
+        .await
+        .map(|id| id.trim().to_string())
+        .unwrap_or_default();
+
+    let id = if valid_device_id(&stored) {
+        stored
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = tokio::fs::write(DEVICE_ID_PATH, &id).await {
+            log_error!(
+                "Failed to write device id to {}: {:?}. This machine will look like a new one \
+                 to the server on every start.",
+                DEVICE_ID_PATH,
+                e
+            );
+        }
+        id
+    };
+
+    log_info!("device id: {}", id);
+    let _ = DEVICE_ID.set(id);
 }
 
 /// The client can start while a core is already running (the supervisor
@@ -573,6 +650,7 @@ pub async fn handle_file_event(save_type: SaveFileType, path: PathBuf) {
     };
 
     let modified_index = update.modified_index;
+    let base_hash = update.base_hash;
 
     if !update.changed {
         log_info!(
@@ -611,15 +689,51 @@ pub async fn handle_file_event(save_type: SaveFileType, path: PathBuf) {
     let server_url = SERVER_URL.lock().await.clone();
     let user_id = USER_ID.lock().await.clone();
 
-    let outcome = upload_file(
-        path,
-        save_type.clone(),
-        modified_index,
-        Some(&file_data),
-        server_url,
-        user_id,
-    )
-    .await;
+    let save_id: SaveId = (save_type.clone(), save_key.clone());
+
+    let outcome = if NO_SYNC.lock().await.contains(&save_id) {
+        log_info!(
+            "{}: set not to sync; the change is recorded locally and not uploaded",
+            save_key
+        );
+        UploadOutcome::NoSync
+    } else {
+        upload_file(
+            path,
+            save_type.clone(),
+            modified_index,
+            base_hash,
+            Some(&file_data),
+            server_url.clone(),
+            user_id,
+        )
+        .await
+    };
+
+    match outcome {
+        UploadOutcome::Accepted => {
+            // This content is the server's current save now, so it is what
+            // the next change will be derived from.
+            if let Some(entry) = category_entry_mut(&mut save_map, &save_type, &save_key) {
+                entry.base_hash = Some(file_hash);
+            }
+        }
+        UploadOutcome::Quarantined => {
+            // base_hash stays put: this machine's copy and the server's
+            // current save still part ways where they did.
+            log_warn!(
+                "{}: the server is holding this change in quarantine. This machine keeps \
+                 playing on its own copy and no other machine is touched; decide which copy \
+                 to keep at {}",
+                save_key,
+                server_url
+            );
+        }
+        UploadOutcome::NoSync => {
+            NO_SYNC.lock().await.insert(save_id);
+        }
+        UploadOutcome::Conflict | UploadOutcome::Failed => {}
+    }
 
     if outcome == UploadOutcome::Conflict {
         // The server has content for this key that this machine never
@@ -642,7 +756,7 @@ pub async fn handle_file_event(save_type: SaveFileType, path: PathBuf) {
         );
 
         match get_server_data(false).await {
-            Ok(remote) => match category_entry(&remote, &save_type, &save_key) {
+            Ok(remote) => match category_entry(&remote.saves, &save_type, &save_key) {
                 Some(remote_entry) => {
                     let remote_index = remote_entry.modified_index;
                     let remote_hash = remote_entry.hash;
@@ -713,6 +827,7 @@ fn insert_save_data(
 ) -> SaveMapUpdate {
     let previous_hash = saves.get(save_key).map(|s| s.hash);
     let previous_index = saves.get(save_key).map(|s| s.modified_index);
+    let base_hash = saves.get(save_key).and_then(|s| s.base_hash);
 
     if saves
         .get(save_key)
@@ -723,6 +838,7 @@ fn insert_save_data(
             modified_index: saves.get(save_key).map_or(0, |s| s.modified_index),
             previous_hash,
             previous_index,
+            base_hash,
             changed: false,
         };
     }
@@ -737,6 +853,7 @@ fn insert_save_data(
         modified_index,
         user_id: "local".to_string(),
         data: None,
+        base_hash,
     };
 
     saves.insert(save_key.to_string(), save_file);
@@ -745,6 +862,7 @@ fn insert_save_data(
         modified_index,
         previous_hash,
         previous_index,
+        base_hash,
         changed: true,
     }
 }
@@ -778,12 +896,24 @@ fn category_entry_mut<'a>(
     }
 }
 
+fn category_map_mut<'a>(
+    data: &'a mut UserSaveData,
+    save_type: &SaveFileType,
+) -> Option<&'a mut HashMap<String, SaveFile>> {
+    match save_type {
+        SaveFileType::GameSave => Some(&mut data.game_saves),
+        SaveFileType::SaveState => Some(&mut data.save_states),
+        SaveFileType::NvRam => Some(&mut data.nv_ram),
+        SaveFileType::CoreWatch => None,
+    }
+}
+
 /// `quiet` is for the background poll: routine lines drop to debug, and
 /// failures are left to the caller to report so an unreachable server isn't
 /// logged as an error every interval.
 async fn get_server_data(
     quiet: bool,
-) -> Result<UserSaveData, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerState, Box<dyn std::error::Error + Send + Sync>> {
     let server_url = SERVER_URL.lock().await.clone();
     let user_id = USER_ID.lock().await.clone();
     log_routine!(
@@ -800,14 +930,14 @@ async fn get_server_data(
     match response {
         Ok(resp) => {
             if resp.status().is_success() {
-                match resp.json::<UserSaveData>().await {
+                match resp.json::<ServerState>().await {
                     Ok(user_data) => {
                         log_routine!(
                             quiet,
                             "server reports {} game saves, {} save states, {} nvram entries",
-                            user_data.game_saves.len(),
-                            user_data.save_states.len(),
-                            user_data.nv_ram.len()
+                            user_data.saves.game_saves.len(),
+                            user_data.saves.save_states.len(),
+                            user_data.saves.nv_ram.len()
                         );
                         Ok(user_data)
                     }
@@ -889,6 +1019,41 @@ async fn sync_saves_with_retry(
     false
 }
 
+/// What a sync needs, beyond the two save maps, to decide what happens to
+/// each save.
+#[derive(Default)]
+struct SyncContext {
+    /// One-shot runs ask at the terminal which copy of a conflict to keep.
+    manage_conflicts: bool,
+    busy_core: Option<String>,
+    /// The server predates quarantine, so the only way to settle two
+    /// differing copies is the old one: the higher modified_index wins.
+    index_rule_only: bool,
+    /// The save map was written by a client from before base_hash. Its
+    /// entries that have none yet are settled by modified_index, as that
+    /// client would have, rather than all being reported as conflicts.
+    legacy_map: bool,
+    no_sync: HashSet<SaveId>,
+    /// Saves where this machine must take the server's copy regardless.
+    overrides: HashSet<SaveId>,
+    /// Hash of each copy the server holds in quarantine for this machine.
+    quarantined: HashMap<SaveId, u64>,
+    server_url: String,
+    user_id: String,
+}
+
+/// What to do with a save whose local and server copies differ.
+enum Plan {
+    /// Upload as the continuation of the server's copy.
+    Replace(String),
+    Download(String),
+    /// Upload for the server to hold in quarantine; keep the local file.
+    Quarantine(String),
+    /// Already in quarantine as it stands; nothing to send.
+    Held,
+    Ask,
+}
+
 /// `quiet` marks a background poll, which logs at info only when it finds
 /// something to do.
 async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -905,23 +1070,51 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     let content = tokio::fs::read_to_string(&save_map_path).await?;
     let mut local_data: UserSaveData = serde_json::from_str(&content)?;
     let saved_map = local_data.clone();
-    let remote_data = get_server_data(quiet).await?;
-    let busy_core = busy_core().await;
+    let server = get_server_data(quiet).await?;
 
-    let manage_conflicts = *IS_ONE_SHOT.lock().await;
-    let server_url = SERVER_URL.lock().await.clone();
-    let user_id = USER_ID.lock().await.clone();
+    let ctx = SyncContext {
+        manage_conflicts: *IS_ONE_SHOT.lock().await,
+        busy_core: busy_core().await,
+        index_rule_only: !server.supports_quarantine,
+        legacy_map: local_data.map_version < SAVE_MAP_VERSION,
+        no_sync: server
+            .no_sync
+            .iter()
+            .map(|s| (s.save_type.clone(), s.key()))
+            .collect(),
+        overrides: server
+            .overrides
+            .iter()
+            .map(|s| (s.save_type.clone(), s.key()))
+            .collect(),
+        quarantined: server
+            .quarantined
+            .iter()
+            .map(|q| {
+                (
+                    (q.save_type.clone(), format!("{}/{}", q.core, q.name)),
+                    q.hash,
+                )
+            })
+            .collect(),
+        server_url: SERVER_URL.lock().await.clone(),
+        user_id: USER_ID.lock().await.clone(),
+    };
+
+    *NO_SYNC.lock().await = ctx.no_sync.clone();
 
     log_routine!(
         quiet,
-        "local save map holds {} game saves, {} save states, {} nvram entries (conflict prompts {})",
+        "local save map holds {} game saves, {} save states, {} nvram entries (conflicts are {})",
         local_data.game_saves.len(),
         local_data.save_states.len(),
         local_data.nv_ram.len(),
-        if manage_conflicts {
-            "enabled"
+        if ctx.manage_conflicts {
+            "asked about here"
+        } else if ctx.index_rule_only {
+            "settled by modified_index, the server has no quarantine"
         } else {
-            "disabled, highest modified_index wins"
+            "sent to quarantine on the server"
         }
     );
 
@@ -932,45 +1125,36 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     deferred += process_category(
         SaveFileType::GameSave,
         &mut local_data.game_saves,
-        &remote_data.game_saves,
-        manage_conflicts,
-        busy_core.as_deref(),
+        &server.saves.game_saves,
+        &ctx,
         &mut download_tasks,
         &mut upload_tasks,
-        server_url.clone(),
-        user_id.clone(),
     )
     .await;
 
     deferred += process_category(
         SaveFileType::SaveState,
         &mut local_data.save_states,
-        &remote_data.save_states,
-        manage_conflicts,
-        busy_core.as_deref(),
+        &server.saves.save_states,
+        &ctx,
         &mut download_tasks,
         &mut upload_tasks,
-        server_url.clone(),
-        user_id.clone(),
     )
     .await;
 
     deferred += process_category(
         SaveFileType::NvRam,
         &mut local_data.nv_ram,
-        &remote_data.nv_ram,
-        manage_conflicts,
-        busy_core.as_deref(),
+        &server.saves.nv_ram,
+        &ctx,
         &mut download_tasks,
         &mut upload_tasks,
-        server_url.clone(),
-        user_id.clone(),
     )
     .await;
 
     let total_tasks = download_tasks.len() + upload_tasks.len();
 
-    if let Some(core) = busy_core.as_deref() {
+    if let Some(core) = ctx.busy_core.as_deref() {
         if deferred > 0 {
             log_info!(
                 "{} save(s) that differ from the server are left alone while {} is running; \
@@ -989,19 +1173,19 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     );
 
     let mp = MultiProgress::new();
-    let total_pb = if total_tasks > 0 && manage_conflicts {
+    let total_pb = if total_tasks > 0 && ctx.manage_conflicts {
         mp.add(ProgressBar::new(total_tasks as u64))
     } else {
         ProgressBar::hidden()
     };
 
-    let download_pb: ProgressBar = if download_tasks.len() > 0 && manage_conflicts {
+    let download_pb: ProgressBar = if download_tasks.len() > 0 && ctx.manage_conflicts {
         mp.add(ProgressBar::new(download_tasks.len() as u64))
     } else {
         ProgressBar::hidden()
     };
 
-    let upload_pb: ProgressBar = if upload_tasks.len() > 0 && manage_conflicts {
+    let upload_pb: ProgressBar = if upload_tasks.len() > 0 && ctx.manage_conflicts {
         mp.add(ProgressBar::new(upload_tasks.len() as u64))
     } else {
         ProgressBar::hidden()
@@ -1018,9 +1202,38 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     download_pb.set_prefix("Download");
     upload_pb.set_prefix("Upload");
 
+    // Whether every save was dealt with, so a save map from an older client
+    // can stop being treated as one.
+    let mut settled = deferred == 0;
+
     for download in download_tasks {
-        if let Err(e) = fetch_save_file(&download).await {
-            log_error!("download of {} failed: {:?}", download.save_key, e);
+        match fetch_save_file(&download).await {
+            Ok(written_hash) => {
+                // Only now does the save map describe the server's copy. Had
+                // it been updated when the download was planned, a failed
+                // download would leave the old file looking like a local
+                // change to the new one, and it would be uploaded over it.
+                if let Some(map) = category_map_mut(&mut local_data, &download.request.save_type)
+                {
+                    map.insert(
+                        download.save_key.clone(),
+                        SaveFile {
+                            hash: written_hash,
+                            base_hash: Some(written_hash),
+                            data: None,
+                            ..download.remote.clone()
+                        },
+                    );
+                }
+
+                if download.ack_override {
+                    ack_override(&download, &ctx).await;
+                }
+            }
+            Err(e) => {
+                log_error!("download of {} failed: {:?}", download.save_key, e);
+                settled = false;
+            }
         }
         download_pb.inc(1);
         total_pb.inc(1);
@@ -1028,10 +1241,11 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
 
     for upload in upload_tasks {
         log_info!(
-            "uploading {}: local hash {} (modified_index {}) replacing server hash {} (modified_index {}); reason: {}{}",
+            "uploading {}: local hash {} (modified_index {}), base {}, server hash {} (modified_index {}); reason: {}{}",
             upload.save_key,
             fmt_hash(upload.local_hash),
             upload.request.modified_index,
+            fmt_hash_opt(upload.base_hash),
             fmt_hash_opt(upload.remote_hash),
             fmt_index_opt(upload.remote_index),
             upload.reason,
@@ -1048,34 +1262,50 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
                 upload.request.save_type,
                 upload.request.modified_index,
                 upload.local_hash,
+                upload.base_hash,
                 upload.request.server_url,
                 upload.request.user_id,
             )
             .await;
         } else {
+            let save_type = upload.request.save_type.clone();
             let outcome = upload_file(
                 upload.request.path,
                 upload.request.save_type,
                 upload.request.modified_index,
+                upload.base_hash,
                 None,
                 upload.request.server_url,
                 upload.request.user_id,
             )
             .await;
 
-            if outcome == UploadOutcome::Conflict {
-                // process_category already decided this upload should win
-                // based on a snapshot of the server fetched moments ago, so
-                // a rejection here means the server changed again in the
-                // meantime (a genuine race with another machine syncing
-                // concurrently) rather than anything this sync got wrong.
-                // No special recovery needed: the next sync re-fetches from
-                // scratch and will re-evaluate this key honestly.
-                log_warn!(
-                    "{}: upload rejected as a conflict - the server changed again after this \
-                     sync fetched its data; this will be re-evaluated on the next sync",
-                    upload.save_key
-                );
+            match outcome {
+                UploadOutcome::Accepted => {
+                    if let Some(entry) =
+                        category_entry_mut(&mut local_data, &save_type, &upload.save_key)
+                    {
+                        entry.base_hash = Some(upload.local_hash);
+                    }
+                }
+                UploadOutcome::Quarantined => log_warn!(
+                    "{}: held in quarantine on the server. This machine keeps its own copy \
+                     and no other machine is touched; decide which copy to keep at {}",
+                    upload.save_key,
+                    ctx.server_url
+                ),
+                UploadOutcome::Conflict => {
+                    // Either the server changed again after this sync fetched
+                    // its data, or it is waiting for this machine to take its
+                    // copy. The next sync re-fetches and re-evaluates.
+                    log_warn!(
+                        "{}: upload rejected as a conflict; this will be re-evaluated on the next sync",
+                        upload.save_key
+                    );
+                    settled = false;
+                }
+                UploadOutcome::NoSync => {}
+                UploadOutcome::Failed => settled = false,
             }
         }
 
@@ -1086,6 +1316,10 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     download_pb.finish();
     upload_pb.finish();
     total_pb.finish_with_message("Sync complete!");
+
+    if settled {
+        local_data.map_version = SAVE_MAP_VERSION;
+    }
 
     // A poll that changed nothing shouldn't rewrite the map every interval:
     // that is needless SD card wear and one more chance for a power cut to
@@ -1099,16 +1333,47 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     Ok(())
 }
 
+/// Tells the server this machine replaced its copy as told, so the server
+/// stops insisting. If this doesn't get through, the next sync downloads the
+/// same copy again and retries.
+async fn ack_override(download: &DownloadTask, ctx: &SyncContext) {
+    let save = SaveRef {
+        core: download.request.core.clone(),
+        name: download.request.name.clone(),
+        save_type: download.request.save_type.clone(),
+    };
+
+    let result = HTTP_CLIENT
+        .post(format!("{}/ack_override/{}", ctx.server_url, ctx.user_id))
+        .json(&save)
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => log_info!(
+            "{}: told the server its copy is now in place here",
+            download.save_key
+        ),
+        Ok(resp) => log_warn!(
+            "{}: server did not take the override acknowledgement: HTTP {}",
+            download.save_key,
+            resp.status()
+        ),
+        Err(e) => log_warn!(
+            "{}: override acknowledgement failed: {:?}",
+            download.save_key,
+            e
+        ),
+    }
+}
+
 async fn process_category(
     save_type: SaveFileType,
     local_saves: &mut HashMap<String, SaveFile>,
     remote_saves: &HashMap<String, SaveFile>,
-    manage_conflicts: bool,
-    busy_core: Option<&str>,
+    ctx: &SyncContext,
     download_tasks: &mut Vec<DownloadTask>,
     upload_tasks: &mut Vec<UploadTask>,
-    server_url: String,
-    user_id: String,
 ) -> usize {
     let mut conflict_state = ConflictAction::AskUser;
     // Saves that need syncing but belong to the running core.
@@ -1129,13 +1394,19 @@ async fn process_category(
     );
 
     for key in all_keys {
-        let local_entry = local_saves.get(&key);
+        let id: SaveId = (save_type.clone(), key.clone());
+        let local_entry = local_saves.get(&key).cloned();
         let remote_entry = remote_saves.get(&key);
 
-        if let Some(core) = busy_core {
+        if ctx.no_sync.contains(&id) {
+            log_debug!("{:?} {}: set not to sync, skipping", save_type, key);
+            continue;
+        }
+
+        if let Some(core) = ctx.busy_core.as_deref() {
             if save_in_use_by(&save_type, &key, core) {
                 let in_sync = matches!(
-                    (local_entry, remote_entry),
+                    (&local_entry, remote_entry),
                     (Some(l), Some(r))
                         if hashes_equal(l.hash, r.hash) && l.modified_index == r.modified_index
                 );
@@ -1152,28 +1423,25 @@ async fn process_category(
             }
         }
 
+        let overridden = ctx.overrides.contains(&id);
+
         match (local_entry, remote_entry) {
             (Some(local), None) => {
-                let local_hash = local.hash;
-                let local_index = local.modified_index;
                 log_info!(
                     "{:?} {}: local only (hash {}, modified_index {}), server has no copy -> upload",
                     save_type,
                     key,
-                    fmt_hash(local_hash),
-                    local_index
+                    fmt_hash(local.hash),
+                    local.modified_index
                 );
                 queue_upload(
                     upload_tasks,
-                    key.clone(),
-                    save_type.clone(),
-                    local_index,
-                    local_hash,
+                    ctx,
+                    &key,
+                    &local,
                     None,
-                    None,
+                    local.base_hash,
                     "save exists locally but not on the server".to_string(),
-                    server_url.clone(),
-                    user_id.clone(),
                     false,
                 );
             }
@@ -1186,21 +1454,44 @@ async fn process_category(
                     fmt_hash(remote.hash),
                     remote.modified_index
                 );
-                let remote = remote.clone();
-                local_saves.insert(key.clone(), remote.clone());
                 queue_download(
                     download_tasks,
-                    key.clone(),
+                    &key,
                     remote,
-                    save_type.clone(),
                     None,
-                    None,
+                    overridden,
                     "save exists on the server but not locally".to_string(),
                 );
             }
 
             (Some(local), Some(remote)) => {
+                if overridden {
+                    log_warn!(
+                        "{:?} {}: this machine's copy was discarded in the web interface; taking \
+                         the server's copy (hash {}) over the local one (hash {})",
+                        save_type,
+                        key,
+                        fmt_hash(remote.hash),
+                        fmt_hash(local.hash)
+                    );
+                    queue_download(
+                        download_tasks,
+                        &key,
+                        remote,
+                        Some(&local),
+                        true,
+                        "the server's copy overrules this machine's".to_string(),
+                    );
+                    continue;
+                }
+
                 if hashes_equal(local.hash, remote.hash) {
+                    if local.base_hash != Some(local.hash) {
+                        if let Some(l_mut) = local_saves.get_mut(&key) {
+                            l_mut.base_hash = Some(local.hash);
+                        }
+                    }
+
                     if local.modified_index < remote.modified_index {
                         log_info!(
                             "{:?} {}: content identical (hash {}), adopting remote modified_index {} (was {}); no file touched",
@@ -1210,10 +1501,8 @@ async fn process_category(
                             remote.modified_index,
                             local.modified_index
                         );
-                        // Update local modified index to match remote
-                        let remote_index = remote.modified_index;
                         if let Some(l_mut) = local_saves.get_mut(&key) {
-                            l_mut.modified_index = remote_index;
+                            l_mut.modified_index = remote.modified_index;
                         }
                     } else if local.modified_index > remote.modified_index {
                         log_info!(
@@ -1224,21 +1513,14 @@ async fn process_category(
                             local.modified_index,
                             remote.modified_index
                         );
-                        let local_hash = local.hash;
-                        let local_index = local.modified_index;
-                        let remote_hash = remote.hash;
-                        let remote_index = remote.modified_index;
                         queue_upload(
                             upload_tasks,
-                            key.clone(),
-                            save_type.clone(),
-                            local_index,
-                            local_hash,
-                            Some(remote_hash),
-                            Some(remote_index),
+                            ctx,
+                            &key,
+                            &local,
+                            Some(remote),
+                            Some(remote.hash),
                             "content identical, local modified_index is ahead".to_string(),
-                            server_url.clone(),
-                            user_id.clone(),
                             true,
                         );
                     } else {
@@ -1255,163 +1537,177 @@ async fn process_category(
                 }
 
                 let local_is_newer = local.modified_index > remote.modified_index;
+                let held = ctx.quarantined.get(&id).copied();
+                let by_index =
+                    ctx.index_rule_only || (local.base_hash.is_none() && ctx.legacy_map);
 
-                if local.modified_index == remote.modified_index {
-                    log_warn!(
-                        "{:?} {}: DIVERGENT - local hash {} and server hash {} differ but both sit at modified_index {}. \
-                         The two copies changed independently and the index cannot break the tie; the server copy will win and the local changes will be lost.",
-                        save_type,
-                        key,
-                        fmt_hash(local.hash),
-                        fmt_hash(remote.hash),
-                        local.modified_index
-                    );
-                } else {
-                    log_info!(
-                        "{:?} {}: content differs - local hash {} (modified_index {}) vs server hash {} (modified_index {}); {} copy is newer",
-                        save_type,
-                        key,
-                        fmt_hash(local.hash),
-                        local.modified_index,
-                        fmt_hash(remote.hash),
-                        remote.modified_index,
-                        if local_is_newer { "local" } else { "server" }
-                    );
-                }
-
-                if !manage_conflicts {
-                    if local_is_newer {
-                        let local_hash = local.hash;
-                        let local_index = local.modified_index;
-                        let remote_hash = remote.hash;
-                        let remote_index = remote.modified_index;
-                        queue_upload(
-                            upload_tasks,
-                            key.clone(),
-                            save_type.clone(),
-                            local_index,
-                            local_hash,
-                            Some(remote_hash),
-                            Some(remote_index),
-                            format!(
-                                "local modified_index {} > server {}",
-                                local_index, remote_index
-                            ),
-                            server_url.clone(),
-                            user_id.clone(),
-                            false,
-                        );
+                let plan = if by_index {
+                    if ctx.manage_conflicts {
+                        Plan::Ask
+                    } else if local_is_newer {
+                        Plan::Replace(format!(
+                            "local modified_index {} > server {}",
+                            local.modified_index, remote.modified_index
+                        ))
                     } else {
-                        let local_hash = local.hash;
-                        let local_index = local.modified_index;
-                        let remote = remote.clone();
-                        let reason = format!(
-                            "server modified_index {} >= local {}",
-                            remote.modified_index, local_index
-                        );
-                        local_saves.insert(key.clone(), remote.clone());
-                        queue_download(
-                            download_tasks,
-                            key.clone(),
-                            remote,
-                            save_type.clone(),
-                            Some(local_hash),
-                            Some(local_index),
-                            reason,
-                        );
-                    }
-                    continue;
-                }
-
-                let (primary, secondary) = if local_is_newer {
-                    (local, remote)
-                } else {
-                    (remote, local)
-                };
-
-                if conflict_state != ConflictAction::KeepLocalAll
-                    && conflict_state != ConflictAction::KeepRemoteAll
-                {
-                    conflict_state = prompt_user_conflict(primary, secondary, local_is_newer);
-                }
-
-                log_info!(
-                    "{:?} {}: conflict resolution is {:?}",
-                    save_type,
-                    key,
-                    conflict_state
-                );
-
-                match conflict_state {
-                    ConflictAction::KeepLocal | ConflictAction::KeepLocalAll => {
-                        let local_hash = local.hash;
-                        let local_index = local.modified_index;
-                        let remote_hash = remote.hash;
-                        let remote_index = remote.modified_index;
-
-                        if local_is_newer {
-                            // Standard upload
-                            queue_upload(
-                                upload_tasks,
-                                key.clone(),
-                                save_type.clone(),
-                                local_index,
-                                local_hash,
-                                Some(remote_hash),
-                                Some(remote_index),
-                                "user kept the local copy, which was already newer".to_string(),
-                                server_url.clone(),
-                                user_id.clone(),
-                                false,
-                            );
-                        } else {
-                            // Force Local: Remote is newer, but we want local.
-                            // Bump local index to Remote + 1 so next sync other clients accepts it.
-                            let new_idx = remote_index + 1;
+                        if local.modified_index == remote.modified_index {
                             log_warn!(
-                                "{:?} {}: forcing local copy (hash {}) over newer server copy (hash {}); bumping modified_index {} -> {} so other machines accept it",
+                                "{:?} {}: DIVERGENT - local hash {} and server hash {} differ but both sit at modified_index {}. \
+                                 The two copies changed independently and the index cannot break the tie; the server copy will win and the local changes will be lost.",
                                 save_type,
                                 key,
-                                fmt_hash(local_hash),
-                                fmt_hash(remote_hash),
-                                local_index,
-                                new_idx
-                            );
-                            if let Some(l_mut) = local_saves.get_mut(&key) {
-                                l_mut.modified_index = new_idx;
-                            }
-                            queue_upload(
-                                upload_tasks,
-                                key.clone(),
-                                save_type.clone(),
-                                new_idx,
-                                local_hash,
-                                Some(remote_hash),
-                                Some(remote_index),
-                                "user kept the local copy over a newer server copy".to_string(),
-                                server_url.clone(),
-                                user_id.clone(),
-                                false,
+                                fmt_hash(local.hash),
+                                fmt_hash(remote.hash),
+                                local.modified_index
                             );
                         }
+                        Plan::Download(format!(
+                            "server modified_index {} >= local {}",
+                            remote.modified_index, local.modified_index
+                        ))
                     }
-                    ConflictAction::KeepRemote | ConflictAction::KeepRemoteAll => {
-                        // Standard download (overwrites local entry in map)
-                        let local_hash = local.hash;
-                        let local_index = local.modified_index;
-                        let remote = remote.clone();
-                        local_saves.insert(key.clone(), remote.clone());
-                        queue_download(
-                            download_tasks,
-                            key.clone(),
-                            remote,
-                            save_type.clone(),
-                            Some(local_hash),
-                            Some(local_index),
-                            "user kept the server copy".to_string(),
+                } else if held.map_or(false, |h| hashes_equal(h, local.hash)) {
+                    Plan::Held
+                } else if held.is_some() {
+                    Plan::Quarantine(
+                        "the copy in quarantine is older than this machine's".to_string(),
+                    )
+                } else if local.base_hash == Some(remote.hash) {
+                    Plan::Replace("local copy was changed from the server's current one".to_string())
+                } else if local.base_hash == Some(local.hash) {
+                    Plan::Download(
+                        "server copy changed, local copy has not since it last synced".to_string(),
+                    )
+                } else if ctx.manage_conflicts {
+                    Plan::Ask
+                } else {
+                    Plan::Quarantine(
+                        "local and server copies both changed; the server decides nothing by itself"
+                            .to_string(),
+                    )
+                };
+
+                let plan = match plan {
+                    Plan::Ask => {
+                        let (primary, secondary) = if local_is_newer {
+                            (&local, remote)
+                        } else {
+                            (remote, &local)
+                        };
+
+                        if conflict_state != ConflictAction::KeepLocalAll
+                            && conflict_state != ConflictAction::KeepRemoteAll
+                        {
+                            conflict_state = prompt_user_conflict(
+                                primary,
+                                secondary,
+                                local_is_newer,
+                                !ctx.index_rule_only,
+                            );
+                        }
+
+                        log_info!(
+                            "{:?} {}: conflict resolution is {:?}",
+                            save_type,
+                            key,
+                            conflict_state
+                        );
+
+                        match conflict_state {
+                            ConflictAction::KeepLocal | ConflictAction::KeepLocalAll => {
+                                Plan::Replace("user kept the local copy".to_string())
+                            }
+                            ConflictAction::KeepRemote | ConflictAction::KeepRemoteAll => {
+                                Plan::Download("user kept the server copy".to_string())
+                            }
+                            ConflictAction::Quarantine => Plan::Quarantine(
+                                "left for a decision in the web interface".to_string(),
+                            ),
+                            ConflictAction::AskUser => continue, // prompt never returns this
+                        }
+                    }
+                    decided => decided,
+                };
+
+                match plan {
+                    Plan::Replace(reason) => {
+                        log_info!(
+                            "{:?} {}: local hash {} (modified_index {}) replaces server hash {} (modified_index {}); {}",
+                            save_type,
+                            key,
+                            fmt_hash(local.hash),
+                            local.modified_index,
+                            fmt_hash(remote.hash),
+                            remote.modified_index,
+                            reason
+                        );
+
+                        // Clients that still go by modified_index only take
+                        // this copy if its index is the higher one.
+                        let mut local = local;
+                        if local.modified_index <= remote.modified_index {
+                            local.modified_index = remote.modified_index + 1;
+                            if let Some(l_mut) = local_saves.get_mut(&key) {
+                                l_mut.modified_index = local.modified_index;
+                            }
+                        }
+
+                        queue_upload(
+                            upload_tasks,
+                            ctx,
+                            &key,
+                            &local,
+                            Some(remote),
+                            Some(remote.hash),
+                            reason,
+                            false,
                         );
                     }
-                    _ => {} // Should not happen given logic above
+                    Plan::Download(reason) => {
+                        log_info!(
+                            "{:?} {}: server hash {} (modified_index {}) replaces local hash {} (modified_index {}); {}",
+                            save_type,
+                            key,
+                            fmt_hash(remote.hash),
+                            remote.modified_index,
+                            fmt_hash(local.hash),
+                            local.modified_index,
+                            reason
+                        );
+                        queue_download(download_tasks, &key, remote, Some(&local), false, reason);
+                    }
+                    Plan::Quarantine(reason) => {
+                        log_warn!(
+                            "{:?} {}: CONFLICT - local hash {} (based on {}) and server hash {} are \
+                             different lines of the same save. Keeping the local file and sending \
+                             it to quarantine on the server; {}",
+                            save_type,
+                            key,
+                            fmt_hash(local.hash),
+                            fmt_hash_opt(local.base_hash),
+                            fmt_hash(remote.hash),
+                            reason
+                        );
+                        queue_upload(
+                            upload_tasks,
+                            ctx,
+                            &key,
+                            &local,
+                            Some(remote),
+                            local.base_hash,
+                            reason,
+                            false,
+                        );
+                    }
+                    Plan::Held => {
+                        log_debug!(
+                            "{:?} {}: local hash {} is in quarantine on the server awaiting a decision",
+                            save_type,
+                            key,
+                            fmt_hash(local.hash)
+                        );
+                    }
+                    Plan::Ask => {}
                 }
             }
             (None, None) => unreachable!(),
@@ -1421,31 +1717,45 @@ async fn process_category(
     deferred
 }
 
+/// `allow_quarantine` is false against a server that has no quarantine to
+/// offer.
 fn prompt_user_conflict(
     newer: &SaveFile,
     older: &SaveFile,
     local_is_newer: bool,
+    allow_quarantine: bool,
 ) -> ConflictAction {
     println!("Conflict: {}/{}", newer.core, newer.name);
     println!(
-        "  Newer ({}): Index {} Hash {}",
+        "  Higher index ({}): Index {} Hash {}",
         if local_is_newer { "Local" } else { "Remote" },
         newer.modified_index,
         fmt_hash(newer.hash)
     );
     println!(
-        "  Older ({}): Index {} Hash {}",
+        "  Lower index ({}): Index {} Hash {}",
         if local_is_newer { "Remote" } else { "Local" },
         older.modified_index,
         fmt_hash(older.hash)
     );
-    println!("Action: (L)ocal, (R)emote, (LALL) Local All, (RALL) Remote All, (A)bort");
+    if allow_quarantine {
+        println!(
+            "Action: (L)ocal, (R)emote, (Q)uarantine - keep both and decide later on the web page, \
+             (LALL) Local All, (RALL) Remote All, (A)bort"
+        );
+    } else {
+        println!("Action: (L)ocal, (R)emote, (LALL) Local All, (RALL) Remote All, (A)bort");
+    }
 
-    // Falling back to the non-interactive rule when there is nobody to ask.
-    // Returning a per-file decision rather than a "...All" one keeps each
-    // remaining conflict resolved on its own merits.
+    // With nobody to ask, nothing is decided here: the local copy goes to
+    // quarantine and both survive. A server without quarantine leaves only
+    // the old rule, the higher modified_index. Either way it is a per-file
+    // answer rather than a "...All" one, so each remaining conflict is still
+    // resolved on its own merits.
     let unattended = || {
-        if local_is_newer {
+        if allow_quarantine {
+            ConflictAction::Quarantine
+        } else if local_is_newer {
             ConflictAction::KeepLocal
         } else {
             ConflictAction::KeepRemote
@@ -1467,34 +1777,34 @@ fn prompt_user_conflict(
             // End of input: there is no terminal to answer the prompt, so
             // looping would spin forever and sync nothing.
             Ok(0) => {
+                let action = unattended();
                 log_warn!(
                     "conflict prompt for {}/{} hit end of input (no interactive stdin); \
-                     falling back to the non-interactive rule, so the {} copy wins on \
-                     modified_index {} vs {}",
+                     falling back to {:?}",
                     newer.core,
                     newer.name,
-                    if local_is_newer { "local" } else { "server" },
-                    newer.modified_index,
-                    older.modified_index
+                    action
                 );
-                return unattended();
+                return action;
             }
             Ok(_) => {}
             Err(e) => {
+                let action = unattended();
                 log_warn!(
-                    "conflict prompt for {}/{} could not read stdin ({:?}); falling back to \
-                     the non-interactive rule",
+                    "conflict prompt for {}/{} could not read stdin ({:?}); falling back to {:?}",
                     newer.core,
                     newer.name,
-                    e
+                    e,
+                    action
                 );
-                return unattended();
+                return action;
             }
         }
 
         return match input.trim().to_uppercase().as_str() {
             "L" => ConflictAction::KeepLocal,
             "R" => ConflictAction::KeepRemote,
+            "Q" if allow_quarantine => ConflictAction::Quarantine,
             "LALL" => ConflictAction::KeepLocalAll,
             "RALL" => ConflictAction::KeepRemoteAll,
             "A" => {
@@ -1512,64 +1822,62 @@ fn prompt_user_conflict(
 
 fn queue_upload(
     upload_tasks: &mut Vec<UploadTask>,
-    path: String,
-    save_type: SaveFileType,
-    index: u64,
-    local_hash: u64,
-    remote_hash: Option<u64>,
-    remote_index: Option<u64>,
+    ctx: &SyncContext,
+    save_key: &str,
+    local: &SaveFile,
+    remote: Option<&SaveFile>,
+    base_hash: Option<u64>,
     reason: String,
-    server_url: String,
-    user_id: String,
     index_only: bool,
 ) {
     upload_tasks.push(UploadTask {
-        save_key: path.clone(),
-        local_hash,
-        remote_hash,
-        remote_index,
+        save_key: save_key.to_string(),
+        local_hash: local.hash,
+        remote_hash: remote.map(|r| r.hash),
+        remote_index: remote.map(|r| r.modified_index),
         reason,
+        base_hash,
         index_only,
         request: UploadSaveRequest {
-            path: PathBuf::from(path),
-            save_type,
-            modified_index: index,
-            server_url,
-            user_id,
+            path: PathBuf::from(save_key),
+            save_type: local.save_type.clone(),
+            modified_index: local.modified_index,
+            server_url: ctx.server_url.clone(),
+            user_id: ctx.user_id.clone(),
         },
     });
 }
 
 fn queue_download(
     download_tasks: &mut Vec<DownloadTask>,
-    save_key: String,
-    remote: SaveFile,
-    save_type: SaveFileType,
-    local_hash: Option<u64>,
-    local_index: Option<u64>,
+    save_key: &str,
+    remote: &SaveFile,
+    local: Option<&SaveFile>,
+    ack_override: bool,
     reason: String,
 ) {
-    let expected_hash = remote.hash;
-    let req = FetchSaveRequest {
-        user_id: remote.user_id,
-        core: remote.core,
-        name: remote.name,
-        save_type,
-        modified_index: remote.modified_index,
-    };
     download_tasks.push(DownloadTask {
-        request: req,
-        save_key,
-        expected_hash,
-        local_hash,
-        local_index,
+        request: FetchSaveRequest {
+            user_id: remote.user_id.clone(),
+            core: remote.core.clone(),
+            name: remote.name.clone(),
+            save_type: remote.save_type.clone(),
+            modified_index: remote.modified_index,
+        },
+        save_key: save_key.to_string(),
+        remote: remote.clone(),
+        ack_override,
+        expected_hash: remote.hash,
+        local_hash: local.map(|l| l.hash),
+        local_index: local.map(|l| l.modified_index),
         reason,
     });
 }
 
+/// Returns the hash of the content now on disk.
 async fn fetch_save_file(
     task: &DownloadTask,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let request = &task.request;
     let server_url = SERVER_URL.lock().await.clone();
 
@@ -1716,7 +2024,7 @@ async fn fetch_save_file(
                     );
                 }
 
-                Ok(())
+                Ok(downloaded_hash)
             } else {
                 log_error!(
                     "{}: server refused to send {} ({:?}): HTTP {}; {} left untouched",
@@ -1748,6 +2056,7 @@ async fn upload_file(
     path: PathBuf,
     save_type: SaveFileType,
     modified_index: u64,
+    base_hash: Option<u64>,
     data: Option<&[u8]>,
     server_url: String,
     user_id: String,
@@ -1829,13 +2138,14 @@ async fn upload_file(
     let stat = file_stat(&full_path).await;
 
     log_info!(
-        "POST /upload_save {}/{} ({:?}) from {} [{}]: hash {}, {} bytes raw, {} bytes compressed, modified_index {}",
+        "POST /upload_save {}/{} ({:?}) from {} [{}]: hash {}, base {}, {} bytes raw, {} bytes compressed, modified_index {}",
         core,
         file_name,
         save_type,
         full_path.display(),
         fmt_stat_opt(stat),
         fmt_hash(file_hash),
+        fmt_hash_opt(base_hash),
         data.len(),
         compressed_data.len(),
         modified_index
@@ -1849,6 +2159,7 @@ async fn upload_file(
         user_id: user_id.clone(),
         data: Some(compressed_data),
         modified_index,
+        base_hash,
     };
 
     match HTTP_CLIENT
@@ -1858,7 +2169,23 @@ async fn upload_file(
         .await
     {
         Ok(resp) => {
-            if resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::ACCEPTED {
+                log_warn!(
+                    "server quarantined {}/{} (hash {}): it is not a continuation of the \
+                     server's current save. The current save is untouched.",
+                    core,
+                    file_name,
+                    fmt_hash(file_hash)
+                );
+                UploadOutcome::Quarantined
+            } else if resp.status() == reqwest::StatusCode::LOCKED {
+                log_info!(
+                    "server refused {}/{}: this save is set not to sync",
+                    core,
+                    file_name
+                );
+                UploadOutcome::NoSync
+            } else if resp.status().is_success() {
                 log_info!(
                     "server accepted {}/{} at hash {} modified_index {}",
                     core,
@@ -1912,6 +2239,7 @@ async fn upload_index_only(
     save_type: SaveFileType,
     modified_index: u64,
     hash: u64,
+    base_hash: Option<u64>,
     server_url: String,
     user_id: String,
 ) {
@@ -1967,6 +2295,7 @@ async fn upload_index_only(
         user_id: user_id.clone(),
         data: None,
         modified_index,
+        base_hash: None,
     };
 
     match HTTP_CLIENT
@@ -1991,7 +2320,16 @@ async fn upload_index_only(
                     file_name,
                     resp.status()
                 );
-                upload_file(path, save_type, modified_index, None, server_url, user_id).await;
+                upload_file(
+                    path,
+                    save_type,
+                    modified_index,
+                    base_hash,
+                    None,
+                    server_url,
+                    user_id,
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -2026,11 +2364,17 @@ pub async fn update_save_map() {
     let mut save_states: HashMap<String, SaveFile> = HashMap::new();
     let mut nv_rams: HashMap<String, SaveFile> = HashMap::new();
 
+    // A map that is missing or unreadable starts over in the current format:
+    // nothing in it has been synced, and that is how its entries get treated.
+    // Only a map an older client really wrote is reconciled the old way.
     let mut existing_map: UserSaveData = tokio::fs::read_to_string(&save_map_path)
         .await
         .ok()
         .and_then(|content| serde_json::from_str::<UserSaveData>(&content).ok())
-        .unwrap_or_default();
+        .unwrap_or_else(|| UserSaveData {
+            map_version: SAVE_MAP_VERSION,
+            ..UserSaveData::default()
+        });
 
     // path of each scanned file, so a change can be reported with its mtime
     let mut scanned_paths: HashMap<String, PathBuf> = HashMap::new();
@@ -2083,6 +2427,7 @@ pub async fn update_save_map() {
                         modified_index: 0,
                         user_id: "local".to_string(),
                         data: None,
+                        base_hash: None,
                     };
 
                     scanned_paths.insert(save_key.clone(), path.clone());
@@ -2135,6 +2480,7 @@ pub async fn update_save_map() {
         }
     }
 
+    result.map_version = existing_map.map_version;
     result.game_saves = existing_map.game_saves;
     result.save_states = existing_map.save_states;
     result.nv_ram = existing_map.nv_ram;
@@ -2239,6 +2585,7 @@ mod tests {
                 modified_index,
                 user_id: "test".to_string(),
                 data: None,
+                base_hash: None,
             },
         )
     }
@@ -2275,11 +2622,46 @@ mod tests {
         assert_eq!(parse_poll_interval("-5"), None);
     }
 
+    fn based(mut entry: (String, SaveFile), base_hash: u64) -> (String, SaveFile) {
+        entry.1.base_hash = Some(base_hash);
+        entry
+    }
+
+    const KEY: &str = "MegaCD/Sonic CD (USA).sav";
+
+    fn sonic_id() -> SaveId {
+        (SaveFileType::GameSave, KEY.to_string())
+    }
+
+    /// Plans a sync of one game save and returns (map after, downloads, uploads).
+    async fn plan(
+        local: (String, SaveFile),
+        remote: (String, SaveFile),
+        ctx: SyncContext,
+    ) -> (HashMap<String, SaveFile>, Vec<DownloadTask>, Vec<UploadTask>) {
+        let mut local: HashMap<String, SaveFile> = HashMap::from([local]);
+        let remote: HashMap<String, SaveFile> = HashMap::from([remote]);
+        let mut downloads = Vec::new();
+        let mut uploads = Vec::new();
+
+        process_category(
+            SaveFileType::GameSave,
+            &mut local,
+            &remote,
+            &ctx,
+            &mut downloads,
+            &mut uploads,
+        )
+        .await;
+
+        (local, downloads, uploads)
+    }
+
     #[tokio::test]
     async fn sync_leaves_the_running_cores_saves_alone() {
         let mut local: HashMap<String, SaveFile> = HashMap::from([
-            save("MegaCD", "Sonic CD (USA).sav", 1, 0),
-            save("PSX", "WipEout 3 (USA).sav", 1, 0),
+            based(save("MegaCD", "Sonic CD (USA).sav", 1, 0), 1),
+            based(save("PSX", "WipEout 3 (USA).sav", 1, 0), 1),
             save("Saturn", "Burning Rangers (USA).sav", 5, 3),
         ]);
         let remote: HashMap<String, SaveFile> = HashMap::from([
@@ -2289,17 +2671,18 @@ mod tests {
         ]);
         let mut downloads = Vec::new();
         let mut uploads = Vec::new();
+        let ctx = SyncContext {
+            busy_core: Some("MegaCD".to_string()),
+            ..SyncContext::default()
+        };
 
         let deferred = process_category(
             SaveFileType::GameSave,
             &mut local,
             &remote,
-            false,
-            Some("MegaCD"),
+            &ctx,
             &mut downloads,
             &mut uploads,
-            "http://server".to_string(),
-            "test".to_string(),
         )
         .await;
 
@@ -2309,34 +2692,213 @@ mod tests {
         assert_eq!(downloads[0].save_key, "PSX/WipEout 3 (USA).sav");
         // The map must keep describing the file that is really on disk, or
         // the deferred save would look synced and never be fetched.
-        assert_eq!(local["MegaCD/Sonic CD (USA).sav"].hash, 1);
-        assert_eq!(local["MegaCD/Sonic CD (USA).sav"].modified_index, 0);
+        assert_eq!(local[KEY].hash, 1);
+        assert_eq!(local[KEY].modified_index, 0);
     }
 
     #[tokio::test]
-    async fn sync_takes_everything_when_no_core_is_running() {
-        let mut local: HashMap<String, SaveFile> =
-            HashMap::from([save("MegaCD", "Sonic CD (USA).sav", 1, 0)]);
-        let remote: HashMap<String, SaveFile> =
-            HashMap::from([save("MegaCD", "Sonic CD (USA).sav", 2, 1)]);
-        let mut downloads = Vec::new();
-        let mut uploads = Vec::new();
-
-        let deferred = process_category(
-            SaveFileType::GameSave,
-            &mut local,
-            &remote,
-            false,
-            None,
-            &mut downloads,
-            &mut uploads,
-            "http://server".to_string(),
-            "test".to_string(),
+    async fn unchanged_local_copy_takes_the_servers() {
+        let (local, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 1, 0), 1),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 1),
+            SyncContext::default(),
         )
         .await;
 
-        assert_eq!(deferred, 0);
+        assert!(uploads.is_empty());
         assert_eq!(downloads.len(), 1);
-        assert_eq!(local["MegaCD/Sonic CD (USA).sav"].hash, 2);
+        assert!(!downloads[0].ack_override);
+        // Planning a download must not touch the map: if the download then
+        // fails, the old file would look like a change to the new save.
+        assert_eq!(local[KEY].hash, 1);
+        assert_eq!(local[KEY].base_hash, Some(1));
+    }
+
+    #[tokio::test]
+    async fn change_made_from_the_servers_copy_is_uploaded_as_its_successor() {
+        // The server's index being the higher one makes no difference.
+        let (_, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 3, 1), 2),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 9),
+            SyncContext::default(),
+        )
+        .await;
+
+        assert!(downloads.is_empty());
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].base_hash, Some(2));
+        assert_eq!(uploads[0].request.modified_index, 10);
+    }
+
+    #[tokio::test]
+    async fn copies_that_both_changed_go_to_quarantine_and_the_file_stays() {
+        // Local index is far ahead; under the old rule it would have replaced
+        // the server's copy outright.
+        let (local, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 7, 40), 1),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            SyncContext::default(),
+        )
+        .await;
+
+        assert!(downloads.is_empty());
+        assert_eq!(uploads.len(), 1);
+        // Sent with its true base, which is not the server's copy, so the
+        // server files it as a conflict.
+        assert_eq!(uploads[0].base_hash, Some(1));
+        assert_eq!(local[KEY].hash, 7);
+    }
+
+    #[tokio::test]
+    async fn never_synced_copy_goes_to_quarantine() {
+        let (_, downloads, uploads) = plan(
+            save("MegaCD", "Sonic CD (USA).sav", 7, 0),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            SyncContext::default(),
+        )
+        .await;
+
+        assert!(downloads.is_empty());
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].base_hash, None);
+    }
+
+    #[tokio::test]
+    async fn copy_already_in_quarantine_is_left_alone() {
+        let ctx = SyncContext {
+            quarantined: HashMap::from([(sonic_id(), 7)]),
+            ..SyncContext::default()
+        };
+        let (_, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 7, 4), 1),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            ctx,
+        )
+        .await;
+
+        assert!(downloads.is_empty());
+        assert!(uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quarantined_copy_follows_further_local_changes() {
+        let ctx = SyncContext {
+            quarantined: HashMap::from([(sonic_id(), 7)]),
+            ..SyncContext::default()
+        };
+        let (_, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 8, 5), 1),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            ctx,
+        )
+        .await;
+
+        assert!(downloads.is_empty());
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].local_hash, 8);
+        assert_eq!(uploads[0].base_hash, Some(1));
+    }
+
+    #[tokio::test]
+    async fn discarded_copy_is_overruled_even_when_newer() {
+        let ctx = SyncContext {
+            overrides: HashSet::from([sonic_id()]),
+            ..SyncContext::default()
+        };
+        let (_, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 9, 50), 7),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            ctx,
+        )
+        .await;
+
+        assert!(uploads.is_empty());
+        assert_eq!(downloads.len(), 1);
+        assert!(downloads[0].ack_override);
+    }
+
+    #[tokio::test]
+    async fn save_set_not_to_sync_is_skipped_both_ways() {
+        let ctx = || SyncContext {
+            no_sync: HashSet::from([sonic_id()]),
+            ..SyncContext::default()
+        };
+
+        let (_, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 1, 0), 1),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 1),
+            ctx(),
+        )
+        .await;
+        assert!(downloads.is_empty() && uploads.is_empty());
+
+        let (_, downloads, uploads) = plan(
+            based(save("MegaCD", "Sonic CD (USA).sav", 3, 2), 2),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 1),
+            ctx(),
+        )
+        .await;
+        assert!(downloads.is_empty() && uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn map_from_an_older_client_is_settled_by_index_once() {
+        let ctx = || SyncContext {
+            legacy_map: true,
+            ..SyncContext::default()
+        };
+
+        let (_, downloads, uploads) = plan(
+            save("MegaCD", "Sonic CD (USA).sav", 1, 3),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            ctx(),
+        )
+        .await;
+        assert_eq!(downloads.len(), 1);
+        assert!(uploads.is_empty());
+
+        let (_, downloads, uploads) = plan(
+            save("MegaCD", "Sonic CD (USA).sav", 1, 6),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            ctx(),
+        )
+        .await;
+        assert!(downloads.is_empty());
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].base_hash, Some(2));
+    }
+
+    #[tokio::test]
+    async fn identical_content_records_the_base_without_transfers() {
+        let (local, downloads, uploads) = plan(
+            save("MegaCD", "Sonic CD (USA).sav", 2, 0),
+            save("MegaCD", "Sonic CD (USA).sav", 2, 5),
+            SyncContext::default(),
+        )
+        .await;
+
+        assert!(downloads.is_empty() && uploads.is_empty());
+        assert_eq!(local[KEY].base_hash, Some(2));
+        assert_eq!(local[KEY].modified_index, 5);
+    }
+
+    #[test]
+    fn local_change_keeps_the_base_it_was_made_from() {
+        let mut saves: HashMap<String, SaveFile> =
+            HashMap::from([based(save("MegaCD", "Sonic CD (USA).sav", 1, 4), 1)]);
+
+        let update = insert_save_data(
+            &mut saves,
+            KEY,
+            "Sonic CD (USA).sav",
+            "MegaCD",
+            2,
+            SaveFileType::GameSave,
+        );
+
+        assert!(update.changed);
+        assert_eq!(update.base_hash, Some(1));
+        assert_eq!(saves[KEY].base_hash, Some(1));
+        assert_eq!(saves[KEY].modified_index, 5);
     }
 }

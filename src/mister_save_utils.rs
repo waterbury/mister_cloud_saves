@@ -34,6 +34,9 @@ pub enum ConflictAction {
     KeepRemote,
     KeepLocalAll,
     KeepRemoteAll,
+    /// Keep the local copy on this machine and hand it to the server as a
+    /// quarantined copy, to be decided on later in the web interface.
+    Quarantine,
     AskUser,
 }
 
@@ -46,6 +49,16 @@ pub struct SaveFile {
     pub modified_index: u64,
     pub user_id: String,
     pub data: Option<Vec<u8>>,
+    /// In a client's save map: hash of the content this machine last had in
+    /// common with the server's current save. None until the save has been
+    /// synced once. A copy the server only took into quarantine does not
+    /// count: the base stays where the two lines parted.
+    ///
+    /// On an upload: the content the upload was derived from. The server
+    /// takes the upload as the new current save only when this matches what
+    /// it currently has; anything else is a conflict and goes to quarantine.
+    #[serde(default)]
+    pub base_hash: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -56,6 +69,65 @@ pub struct UserSaveData {
 
     #[serde(default)]
     pub nv_ram: HashMap<String, SaveFile>,
+
+    /// Format of a client's save map. 0 is a map written before `base_hash`
+    /// existed, whose entries are reconciled once by modified_index.
+    #[serde(default)]
+    pub map_version: u32,
+}
+
+/// `map_version` written by this client.
+pub const SAVE_MAP_VERSION: u32 = 1;
+
+/// Request header naming the machine a client runs on. A client that sends
+/// it gets conflicting uploads quarantined rather than rejected.
+pub const DEVICE_ID_HEADER: &str = "X-Device-Id";
+
+/// Names one save without carrying its metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SaveRef {
+    pub core: String,
+    pub name: String,
+    pub save_type: SaveFileType,
+}
+
+impl SaveRef {
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.core, self.name)
+    }
+}
+
+/// A copy the server is holding in quarantine for the requesting machine.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedSave {
+    pub core: String,
+    pub name: String,
+    pub save_type: SaveFileType,
+    pub hash: u64,
+}
+
+/// What `/fetch_user_data` returns: the save metadata, plus the decisions
+/// made in the web interface that the requesting machine has to honor. The
+/// extra fields default to empty so a server from before they existed still
+/// parses.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerState {
+    #[serde(flatten)]
+    pub saves: UserSaveData,
+    /// False from a server that predates quarantine and resolves conflicts
+    /// by modified_index alone.
+    #[serde(default)]
+    pub supports_quarantine: bool,
+    /// Saves no machine may upload or download.
+    #[serde(default)]
+    pub no_sync: Vec<SaveRef>,
+    /// The requesting machine's copies held in quarantine.
+    #[serde(default)]
+    pub quarantined: Vec<QuarantinedSave>,
+    /// Saves where the requesting machine's copy was discarded: it must take
+    /// the server's copy whatever it holds locally, then acknowledge.
+    #[serde(default)]
+    pub overrides: Vec<SaveRef>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
