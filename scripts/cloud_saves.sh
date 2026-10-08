@@ -237,16 +237,18 @@ def get_client_version():
     if not os.path.isfile(client_bin):
         return "not installed"
 
-    result = subprocess.run(
-        [client_bin, "--version"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    version = result.stdout.strip().split()[-1]
-
-    return version
+    # A client that cannot start (for example one built for a newer glibc
+    # than the MiSTer has) must not stop the update that would replace it.
+    try:
+        result = subprocess.run(
+            [client_bin, "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip().split()[-1]
+    except (OSError, subprocess.CalledProcessError, IndexError):
+        return "unknown (installed client does not run)"
 
 
 def extract_client():
