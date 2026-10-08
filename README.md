@@ -15,7 +15,7 @@ A utility to sync MiSTer FPGA save files with a cloud server.
 
 ## Installation
 
-Grab the [`cloud_saves.sh`](https://github.com/bleach86/mister_cloud_saves/blob/main/scripts/cloud_saves.sh) file from the `scripts` directory in this repository and place it in the `Scripts` folder of your MiSTer FPGA's SD card.
+Grab the [`cloud_saves.sh`](https://github.com/waterbury/mister_cloud_saves/blob/main/scripts/cloud_saves.sh) file from the `scripts` directory in this repository and place it in the `Scripts` folder of your MiSTer FPGA's SD card.
 
 Make sure to make a backup of your saves and savestates directories before proceeding!
 
@@ -48,7 +48,7 @@ During the initial setup on the first MiSTer, an `.ini` file named `cloud_saves.
 Copy this file to the root of the SD card on each additional MiSTer device you want to sync with the same cloud server.
 
 Each device will also need the  
-[`cloud_saves.sh`](https://github.com/bleach86/mister_cloud_saves/blob/main/scripts/cloud_saves.sh) script placed in the `Scripts` folder.
+[`cloud_saves.sh`](https://github.com/waterbury/mister_cloud_saves/blob/main/scripts/cloud_saves.sh) script placed in the `Scripts` folder.
 
 Once copied, run the **cloud_saves** script from the MiSTer menu on each additional device. The script will detect the existing `cloud_saves.ini` file and automatically use the same server URL and user ID as the first device.
 
@@ -264,9 +264,9 @@ intentional.
 
 ## Updating
 
-Mister Cloud Saves is updated using the `update` or `update_all` script from the MiSTer Scripts menu.
+Mister Cloud Saves is updated by running the `cloud_saves` script again from the MiSTer menu. When prompted, choose the update option. The script will download and install the latest release of the client from this repository and perform a sync.
 
-An update can also be preformed by running the `cloud_saves` script again from the MiSTer menu. When prompted, choose the update option. The script will download and install the latest version of the client and perform a sync.
+It is not updated by the `update` or `update_all` scripts. Earlier versions added a `[mister_cloud_saves]` section to `downloader.ini` that pointed at the upstream project's update database; the `cloud_saves` script now removes that section, so `update_all` no longer replaces the client or the scripts.
 
 ## Uninstallation
 

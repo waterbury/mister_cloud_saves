@@ -16,14 +16,13 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # You can download the latest version of this tool from:
-# https://github.com/bleach86/mister_cloud_saves
+# https://github.com/waterbury/mister_cloud_saves
 
 import datetime
 import os
 import signal
 import subprocess
 import sys
-import shutil
 import time
 
 
@@ -49,29 +48,21 @@ _stop_requested = False
 _current_child = None
 
 
-def check_updates():
+def discard_pending_update_archive():
     """
-    Checks for updates to the Mister Cloud Saves Client.
+    Deletes a client archive left in the updates directory by update_all.
+
+    The launcher used to extract that archive over the installed client at
+    boot. It comes from the upstream update database, so installing it would
+    replace this client with the upstream build; the client is now only
+    updated by cloud_saves.sh.
     """
     update_file = os.path.join(UPDATES_DIR, "client.tar.xz")
 
-    if os.path.isfile(update_file):
-        extract_client(update_file)
-
-
-def extract_client(update_file_path):
-    """
-    Extracts the client archive to the client directory.
-    """
-    if os.path.isfile(update_file_path):
-        if not os.path.isdir(CLIENT_DIR):
-            os.makedirs(CLIENT_DIR)
-
-        shutil.unpack_archive(update_file_path, CLIENT_DIR, format="xztar")
-        os.remove(update_file_path)
-    else:
-        print("Client archive not found")
-        sys.exit(1)
+    try:
+        os.remove(update_file)
+    except OSError:
+        pass
 
 
 def _log(message):
@@ -265,10 +256,10 @@ def run_client():
 
 def main():
     """
-    Main function to check for updates and run the Mister Cloud Saves Client.
+    Main function to run the Mister Cloud Saves Client.
     """
 
-    check_updates()
+    discard_pending_update_archive()
     run_client()
 
 

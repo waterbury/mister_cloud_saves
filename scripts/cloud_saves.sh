@@ -16,7 +16,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # You can download the latest version of this tool from:
-# https://github.com/bleach86/mister_cloud_saves
+# https://github.com/waterbury/mister_cloud_saves
 
 
 import os
@@ -31,14 +31,11 @@ import requests  # type: ignore
 
 DEFAULT_SERVER_URL = "https://mister-cloud-saves.tuxprint.com"
 GH_REPO_API_URL = (
-    "https://api.github.com/repos/bleach86/mister_cloud_saves/releases/latest"
+    "https://api.github.com/repos/waterbury/mister_cloud_saves/releases/latest"
 )
 
-RAW_URL_BASE = "https://raw.githubusercontent.com/bleach86/mister_cloud_saves"
+RAW_URL_BASE = "https://raw.githubusercontent.com/waterbury/mister_cloud_saves"
 SCRIPT_RAW_URL = f"{RAW_URL_BASE}/refs/heads/main/scripts/cloud_saves.sh"
-UPDATE_DB_RAW_URL = (
-    f"{RAW_URL_BASE}_update_db/refs/heads/main/mister_cloud_saves_db.json"
-)
 LAUNCHER_SCRIPT_URL = f"{RAW_URL_BASE}/refs/heads/main/scripts/cloud_saves_launcher.sh"
 MISTER_PATH = "/media/fat"
 CLIENT_DIR = os.path.join(MISTER_PATH, "cloud_saves")
@@ -364,30 +361,15 @@ def get_downloader_ini():
     return config
 
 
-def add_to_updater_if_needed():
-    """
-    Adds Mister Cloud Saves database update to downloader.ini if not already present.
-    """
-
-    config = get_downloader_ini()
-
-    if "mister_cloud_saves" not in config.sections():
-        print("Adding Mister Cloud Saves database update to downloader.ini...")
-
-        config["mister_cloud_saves"] = {}
-        config["mister_cloud_saves"]["db_url"] = UPDATE_DB_RAW_URL
-
-        with open(
-            os.path.join(MISTER_PATH, "downloader.ini"),
-            "w",
-            encoding="utf-8",
-        ) as configfile:
-            config.write(configfile)
-
-
 def remove_from_updater():
     """
     Removes Mister Cloud Saves database update from downloader.ini if present.
+
+    Earlier versions of this script registered the upstream update database
+    there, which has update_all replace this script, the launcher and the
+    client with the upstream builds. Updates now only come from this script's
+    own update option, so the entry is removed on install and update as well
+    as on uninstall.
     """
 
     config = get_downloader_ini()
@@ -405,14 +387,19 @@ def remove_from_updater():
             config.write(configfile)
 
 
-def create_updates_dir_if_needed():
+def discard_pending_update_archive():
     """
-    Creates the updates directory if it does not exist.
+    Deletes a client archive left in the updates directory by update_all.
+
+    Launchers from before the downloader.ini entry was dropped extract that
+    archive over the installed client at the next boot, so it has to be gone
+    before the reboot that follows an install or update.
     """
 
-    updates_dir = os.path.join(CLIENT_DIR, "updates")
-    if not os.path.isdir(updates_dir):
-        os.makedirs(updates_dir)
+    update_file = os.path.join(CLIENT_DIR, "updates", "client.tar.xz")
+    if os.path.isfile(update_file):
+        print("Discarding client archive left by update_all...")
+        os.remove(update_file)
 
 
 def _read_pid_file(pid_path):
@@ -547,8 +534,8 @@ def install():
         print("Configuration file already exists. Skipping creation.")
 
     update_user_scripts_install()
-    create_updates_dir_if_needed()
-    add_to_updater_if_needed()
+    remove_from_updater()
+    discard_pending_update_archive()
 
     run_initial_sync()
     reboot_system()
@@ -634,9 +621,9 @@ def update():
     print(f"Current installed version: {current_version}")
     print(f"Latest available version: {latest_version}")
 
-    # Ensure the updates directory exists and the updater is configured
-    add_to_updater_if_needed()
-    create_updates_dir_if_needed()
+    # update_all must not manage this install (see remove_from_updater)
+    remove_from_updater()
+    discard_pending_update_archive()
     update_user_scripts_migrate()
 
     fetch_launcher_script()
