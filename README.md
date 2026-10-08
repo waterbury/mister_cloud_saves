@@ -93,11 +93,13 @@ poll_interval_seconds = 60
 ## Conflicts and the Web Page
 
 Open the server's address in a browser (for example `http://your-server:8000/`)
-and choose your user ID from the list; yours is the `user_id` line in
-`cloud_saves.ini`. The page can be bookmarked once it is open. There are no
-accounts, and the page lists every user ID on the server: anyone who can reach
-the server can manage any user's saves, so don't expose it to the internet
-without something in front of it.
+and enter your user ID, the `user_id` line in `cloud_saves.ini`. The field is
+a password field, so the browser can save it and fill it in for you. The
+browser then stays signed in: a cookie remembers the user ID for 400 days from
+the last visit, until you choose "Switch user". There are no separate
+accounts: as with the MiSTers themselves, whoever has the user ID can manage
+the saves, so don't expose the server to the internet without something in
+front of it.
 
 ### What counts as a conflict
 

@@ -74,7 +74,7 @@
   button.danger { color: var(--danger); }
   button.link { border: 0; padding: 0; background: none; color: var(--accent); text-decoration: underline; }
   button:disabled { opacity: 0.5; cursor: default; }
-  input[type=text], input[type=search] {
+  input[type=text], input[type=search], input[type=password] {
     font: inherit; padding: 6px 10px; border-radius: 6px; width: 100%;
     border: 1px solid var(--line); background: var(--panel); color: var(--text);
   }
@@ -90,9 +90,7 @@
   th { color: var(--muted); font-weight: normal; font-size: 13px; }
   td.name { overflow-wrap: anywhere; min-width: 180px; }
   td.act { white-space: nowrap; text-align: right; }
-  .users { display: flex; flex-direction: column; gap: 8px; }
-  .users button { text-align: left; width: 100%; padding: 10px 12px; }
-  .users .id { display: block; overflow-wrap: anywhere; }
+  .offscreen { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }
   .stamp { display: block; font-size: 12px; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .row .grow { flex: 1 1 200px; }
@@ -109,11 +107,22 @@
   </header>
 
   <section id="login" class="panel" hidden>
-    <p>Choose a user</p>
-    <div id="users" class="users"></div>
-    <p class="muted small">Yours is the <code>user_id</code> line in <code>cloud_saves.ini</code>
-      at the root of your MiSTer's SD card.</p>
-    <p id="login-error" class="error" hidden></p>
+    <form id="login-form" method="post" action="/">
+      <p><label for="user-id">User ID</label></p>
+      <!-- A password field with a fixed username beside it, so the browser
+           offers to save the user ID and fills it in the next time. -->
+      <input class="offscreen" type="text" name="username" autocomplete="username"
+             value="MiSTer Cloud Saves" readonly tabindex="-1" aria-hidden="true">
+      <div class="row">
+        <input class="grow mono" id="user-id" type="password" name="password"
+               autocomplete="current-password" spellcheck="false" required>
+        <button class="primary" type="submit">Open</button>
+      </div>
+      <p class="muted small">It is the <code>user_id</code> line in <code>cloud_saves.ini</code>
+        at the root of your MiSTer's SD card. Anyone who has it can manage these saves.
+        This browser stays signed in afterwards.</p>
+      <p id="login-error" class="error" hidden></p>
+    </form>
   </section>
 
   <div id="app" hidden>
@@ -183,17 +192,18 @@
     return node;
   }
 
-  function remember(id) {
+  // Earlier versions of the page kept the user ID in the address and in
+  // localStorage. One found there is signed in with once, then cleared: the
+  // server's cookie remembers it from then on.
+  function carriedOver() {
+    var id = "";
+    try { id = decodeURIComponent(location.hash.replace(/^#/, "")).trim(); } catch (e) { /* not an ID */ }
     try {
-      if (id) localStorage.setItem(STORAGE_KEY, id);
-      else localStorage.removeItem(STORAGE_KEY);
-    } catch (e) { /* private window: the URL still carries it */ }
-  }
-
-  function recall() {
-    var fromUrl = decodeURIComponent(location.hash.replace(/^#/, "")).trim();
-    if (fromUrl) return fromUrl;
-    try { return localStorage.getItem(STORAGE_KEY) || ""; } catch (e) { return ""; }
+      id = id || localStorage.getItem(STORAGE_KEY) || "";
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (e) { /* private window */ }
+    if (location.hash) history.replaceState(null, "", location.pathname);
+    return id;
   }
 
   function ago(seconds) {
@@ -434,7 +444,7 @@
   function load() {
     return api("/overview").then(function (response) {
       if (response.status === 404) {
-        signOut("The server does not know that user ID.");
+        signOut("The server no longer knows that user ID.", true);
         return;
       }
       if (!response.ok) throw new Error("HTTP " + response.status);
@@ -451,15 +461,13 @@
       });
     }).catch(function () {
       if (data) showStatus("Could not reach the server. Showing what was loaded last.");
-      else signOut("Could not reach the server.");
+      else showLogin("Could not reach the server.");
     });
   }
 
-  function signIn(id) {
-    userId = id.trim();
-    if (!userId) return;
-    remember(userId);
-    history.replaceState(null, "", "#" + encodeURIComponent(userId));
+  function open(id) {
+    userId = id;
+    $("user-id").value = "";
     load();
     clearInterval(timer);
     timer = setInterval(function () {
@@ -467,54 +475,64 @@
     }, REFRESH_MS);
   }
 
-  function signOut(message) {
-    clearInterval(timer);
-    userId = "";
-    data = null;
-    remember("");
-    history.replaceState(null, "", location.pathname);
+  function showLogin(message) {
     ["app", "refresh", "logout", "who"].forEach(function (id) { $(id).hidden = true; });
     $("login").hidden = false;
     $("login-error").textContent = message || "";
     $("login-error").hidden = !message;
-    listUsers();
+    $("user-id").focus();
   }
 
-  function listUsers() {
-    var box = $("users");
-    box.replaceChildren(el("p", { class: "muted" }, ["Loading…"]));
-    fetch("/api/users").then(function (response) {
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      return response.json();
-    }).then(function (users) {
-      if (userId) return;
-      box.replaceChildren();
-      if (!users.length) {
-        box.appendChild(el("p", { class: "muted" }, [
-          "No users yet. One appears here once a MiSTer has been set up against this server."
-        ]));
-      }
-      users.forEach(function (u) {
-        box.appendChild(el("button", { type: "button", onclick: function () { signIn(u.id); } }, [
-          el("span", { class: "id mono" }, [u.id]),
-          el("span", { class: "muted small" }, [u.devices.length
-            ? u.devices.join(", ") + " · last seen " + ago(u.last_seen)
-            : "no MiSTer has checked in yet"])
-        ]));
-      });
+  // The server checks the ID and sets the cookie that keeps this browser
+  // signed in.
+  function signIn(id) {
+    id = id.trim();
+    if (!id) return;
+    fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: id })
+    }).then(function (response) {
+      if (response.ok) open(id);
+      else if (response.status === 404) showLogin("The server does not know that user ID.");
+      else showLogin("That did not go through (HTTP " + response.status + ").");
     }).catch(function () {
-      if (userId) return;
-      box.replaceChildren(el("p", { class: "error" }, ["Could not load the list of users."]));
+      showLogin("Could not reach the server.");
     });
   }
 
-  $("logout").addEventListener("click", function () { signOut(""); });
+  // `forget` also drops the cookie; without it the browser is only shown the
+  // form again.
+  function signOut(message, forget) {
+    clearInterval(timer);
+    userId = "";
+    data = null;
+    if (forget) fetch("/api/logout", { method: "POST" }).catch(function () {});
+    showLogin(message);
+  }
+
+  $("login-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    signIn($("user-id").value);
+  });
+  $("logout").addEventListener("click", function () { signOut("", true); });
   $("refresh").addEventListener("click", function () { load(); });
   $("filter").addEventListener("input", function () { if (data) renderSaves(); });
 
-  var known = recall();
-  if (known) signIn(known);
-  else signOut("");
+  var carried = carriedOver();
+  if (carried) {
+    signIn(carried);
+  } else {
+    fetch("/api/session").then(function (response) {
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      return response.json();
+    }).then(function (id) {
+      if (id) open(id);
+      else showLogin("");
+    }).catch(function () {
+      showLogin("Could not reach the server.");
+    });
+  }
 })();
 </script>
 </body>

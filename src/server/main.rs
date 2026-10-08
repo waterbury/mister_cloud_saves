@@ -1098,18 +1098,41 @@ mod tests {
         );
         assert!(t.client.get("/").dispatch().await.into_string().await.unwrap().contains("<title>"));
 
-        let users: serde_json::Value = t
-            .client
-            .get("/api/users")
-            .dispatch()
-            .await
-            .into_json()
-            .await
-            .unwrap();
-        assert_eq!(users.as_array().unwrap().len(), 1);
-        assert_eq!(users[0]["id"], t.user.as_str());
-        assert!(users[0]["devices"].as_array().unwrap().iter().any(|d| d == "Den"));
-        assert!(users[0]["last_seen"].as_u64().is_some());
+        {
+            // The page's login: a known user id is remembered by cookie, which
+            // the tracked client sends back like a browser would.
+            let client = &t.client;
+            let session = || async move {
+                client
+                    .get("/api/session")
+                    .dispatch()
+                    .await
+                    .into_json::<Option<String>>()
+                    .await
+                    .unwrap()
+            };
+            let login = |id: String| async move {
+                client
+                    .post("/api/login")
+                    .header(ContentType::JSON)
+                    .body(serde_json::json!({ "user_id": id }).to_string())
+                    .dispatch()
+                    .await
+            };
+            assert_eq!(session().await, None);
+            assert_eq!(login("no-such-user".to_string()).await.status().code, 404);
+            assert_eq!(session().await, None);
+
+            let response = login(format!(" {} ", t.user)).await;
+            assert_eq!(response.status().code, 200);
+            let cookie = response.headers().get_one("Set-Cookie").unwrap().to_string();
+            assert!(cookie.contains("HttpOnly") && cookie.contains("Max-Age=34560000"));
+            assert_eq!(session().await, Some(t.user.clone()));
+
+            assert_eq!(t.client.post("/api/logout").dispatch().await.status().code, 200);
+            assert_eq!(session().await, None);
+            assert_eq!(t.client.get("/api/users").dispatch().await.status().code, 404);
+        }
 
         drop(t);
         let _ = std::fs::remove_dir_all(&dir);
