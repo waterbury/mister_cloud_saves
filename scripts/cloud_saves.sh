@@ -30,9 +30,8 @@ import hashlib
 import requests  # type: ignore
 
 DEFAULT_SERVER_URL = "https://mister-cloud-saves.tuxprint.com"
-GH_REPO_API_URL = (
-    "https://api.github.com/repos/waterbury/mister_cloud_saves/releases/latest"
-)
+GH_REPO_URL = "https://github.com/waterbury/mister_cloud_saves"
+LATEST_RELEASE_URL = f"{GH_REPO_URL}/releases/latest"
 
 RAW_URL_BASE = "https://raw.githubusercontent.com/waterbury/mister_cloud_saves"
 SCRIPT_RAW_URL = f"{RAW_URL_BASE}/refs/heads/main/scripts/cloud_saves.sh"
@@ -160,19 +159,30 @@ def get_tag_and_latest_release_url():
     """
     Gets the latest release download URL from GitHub.
 
+    The tag is read from where the releases/latest page redirects to rather
+    than from api.github.com, which allows only 60 requests an hour per
+    public IP address and so fails when other devices on the same network
+    have used them up.
+
     :return: Download URL string
     """
 
-    response = requests.get(GH_REPO_API_URL, timeout=30)
-    if response.status_code == 200:
-        data = response.json()
-        tag_name = data.get("tag_name", "unknown")
+    try:
+        response = requests.get(LATEST_RELEASE_URL, timeout=30, allow_redirects=False)
+    except requests.RequestException as error:
+        print(f"Error fetching latest release info: {error}")
+        sys.exit(1)
 
-        for asset in data.get("assets", []):
-            if asset.get("name") == "client.tar.xz":
-                return (asset.get("browser_download_url"), tag_name)
+    location = response.headers.get("Location", "")
 
-    print("Error fetching latest release info")
+    if response.status_code in (301, 302, 303, 307, 308) and "/releases/tag/" in location:
+        tag_name = location.rstrip("/").rsplit("/", 1)[-1]
+        return (f"{GH_REPO_URL}/releases/download/{tag_name}/client.tar.xz", tag_name)
+
+    print(
+        f"Error fetching latest release info (HTTP {response.status_code} "
+        f"from {LATEST_RELEASE_URL})"
+    )
     sys.exit(1)
 
 
@@ -211,7 +221,7 @@ def fetch_client(download_url=None):
         ) as file:
             file.write(response.content)
     else:
-        print("Error downloading client")
+        print(f"Error downloading client (HTTP {response.status_code} from {download_url})")
         sys.exit(1)
 
 
