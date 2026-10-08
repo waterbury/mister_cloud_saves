@@ -1072,8 +1072,13 @@ async fn sync_saves(quiet: bool) -> Result<(), Box<dyn std::error::Error + Send 
     let saved_map = local_data.clone();
     let server = get_server_data(quiet).await?;
 
+    // Read into a local first: a guard taken inside the struct literal would
+    // live until the end of the statement, and busy_core() locks IS_ONE_SHOT
+    // itself.
+    let manage_conflicts = *IS_ONE_SHOT.lock().await;
+
     let ctx = SyncContext {
-        manage_conflicts: *IS_ONE_SHOT.lock().await,
+        manage_conflicts,
         busy_core: busy_core().await,
         index_rule_only: !server.supports_quarantine,
         legacy_map: local_data.map_version < SAVE_MAP_VERSION,
