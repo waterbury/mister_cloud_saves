@@ -90,6 +90,10 @@
   th { color: var(--muted); font-weight: normal; font-size: 13px; }
   td.name { overflow-wrap: anywhere; min-width: 180px; }
   td.act { white-space: nowrap; text-align: right; }
+  .users { display: flex; flex-direction: column; gap: 8px; }
+  .users button { text-align: left; width: 100%; padding: 10px 12px; }
+  .users .id { display: block; overflow-wrap: anywhere; }
+  .stamp { display: block; font-size: 12px; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .row .grow { flex: 1 1 200px; }
   [hidden] { display: none !important; }
@@ -105,17 +109,11 @@
   </header>
 
   <section id="login" class="panel" hidden>
-    <form id="login-form">
-      <p><label for="user-id">User ID</label></p>
-      <div class="row">
-        <input class="grow mono" id="user-id" type="text" autocomplete="off" spellcheck="false"
-               placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-        <button class="primary" type="submit">Open</button>
-      </div>
-      <p class="muted small">It is the <code>user_id</code> line in <code>cloud_saves.ini</code>
-        at the root of your MiSTer's SD card. Anyone who has it can manage these saves.</p>
-      <p id="login-error" class="error" hidden></p>
-    </form>
+    <p>Choose a user</p>
+    <div id="users" class="users"></div>
+    <p class="muted small">Yours is the <code>user_id</code> line in <code>cloud_saves.ini</code>
+      at the root of your MiSTer's SD card.</p>
+    <p id="login-error" class="error" hidden></p>
   </section>
 
   <div id="app" hidden>
@@ -212,6 +210,20 @@
     return el("span", { title: new Date(seconds * 1000).toLocaleString() }, [ago(seconds)]);
   }
 
+  // The relative time, and under it the date and time in the browser's
+  // time zone, named.
+  function stamped(seconds, by) {
+    if (!seconds) return el("span", {}, ["unknown"]);
+    var exact = new Date(seconds * 1000).toLocaleString(undefined, {
+      year: "numeric", month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short"
+    });
+    return el("span", {}, [
+      ago(seconds) + (by ? " by " + by : ""),
+      el("span", { class: "stamp muted" }, [exact])
+    ]);
+  }
+
   function size(bytes) {
     if (bytes === null || bytes === undefined) return "unknown";
     if (bytes < 1024) return bytes + " bytes";
@@ -285,14 +297,14 @@
     var sameSize = q.current_size !== null && q.current_size === q.size;
 
     var current = q.current ? side("Current save, on every other MiSTer", [
-      field("Last changed", when(q.current.updated_at)),
+      field("Last changed", stamped(q.current.updated_at)),
       field("By", q.current.updated_by || "unknown"),
       field("Size", size(q.current_size)),
       field("Fingerprint", el("span", { class: "mono" }, [q.current.hash]))
     ], downloadUrl(q)) : el("div", { class: "side muted" }, ["The server has no current copy."]);
 
     var held = side("Held copy, from " + who, [
-      field("Last changed", when(q.updated_at)),
+      field("Last changed", stamped(q.updated_at)),
       field("Conflict began", when(q.first_at)),
       field("Size", size(q.size)),
       field("Fingerprint", el("span", { class: "mono" }, [q.hash]))
@@ -400,7 +412,7 @@
           s.save_type === "GameSave" ? null : el("span", { class: "badge" }, [typeLabel(s.save_type)])
         ]),
         el("td", { class: "muted" }, s.updated_at
-          ? [when(s.updated_at), s.updated_by ? " by " + s.updated_by : ""]
+          ? [stamped(s.updated_at, s.updated_by)]
           : [""]),
         el("td", { class: "act" }, [s.no_sync
           ? el("span", { class: "badge" }, ["not syncing"])
@@ -465,13 +477,37 @@
     $("login").hidden = false;
     $("login-error").textContent = message || "";
     $("login-error").hidden = !message;
-    $("user-id").focus();
+    listUsers();
   }
 
-  $("login-form").addEventListener("submit", function (event) {
-    event.preventDefault();
-    signIn($("user-id").value);
-  });
+  function listUsers() {
+    var box = $("users");
+    box.replaceChildren(el("p", { class: "muted" }, ["Loading…"]));
+    fetch("/api/users").then(function (response) {
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      return response.json();
+    }).then(function (users) {
+      if (userId) return;
+      box.replaceChildren();
+      if (!users.length) {
+        box.appendChild(el("p", { class: "muted" }, [
+          "No users yet. One appears here once a MiSTer has been set up against this server."
+        ]));
+      }
+      users.forEach(function (u) {
+        box.appendChild(el("button", { type: "button", onclick: function () { signIn(u.id); } }, [
+          el("span", { class: "id mono" }, [u.id]),
+          el("span", { class: "muted small" }, [u.devices.length
+            ? u.devices.join(", ") + " · last seen " + ago(u.last_seen)
+            : "no MiSTer has checked in yet"])
+        ]));
+      });
+    }).catch(function () {
+      if (userId) return;
+      box.replaceChildren(el("p", { class: "error" }, ["Could not load the list of users."]));
+    });
+  }
+
   $("logout").addEventListener("click", function () { signOut(""); });
   $("refresh").addEventListener("click", function () { load(); });
   $("filter").addEventListener("input", function () { if (data) renderSaves(); });

@@ -1098,6 +1098,19 @@ mod tests {
         );
         assert!(t.client.get("/").dispatch().await.into_string().await.unwrap().contains("<title>"));
 
+        let users: serde_json::Value = t
+            .client
+            .get("/api/users")
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap();
+        assert_eq!(users.as_array().unwrap().len(), 1);
+        assert_eq!(users[0]["id"], t.user.as_str());
+        assert!(users[0]["devices"].as_array().unwrap().iter().any(|d| d == "Den"));
+        assert!(users[0]["last_seen"].as_u64().is_some());
+
         drop(t);
         let _ = std::fs::remove_dir_all(&dir);
     }

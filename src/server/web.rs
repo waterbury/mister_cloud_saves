@@ -1,7 +1,8 @@
 //! The web interface: one page, and the JSON routes it calls.
 //!
-//! Like the rest of the server it has no accounts. Knowing a user id is what
-//! grants access to that user's saves, here exactly as on the sync routes.
+//! Like the rest of the server it has no accounts. The page lists every user
+//! id the server holds, so anyone who can reach the server can manage any
+//! user's saves.
 
 use rocket::State;
 use rocket::http::{Header, Status};
@@ -27,6 +28,7 @@ const MAX_DEVICE_NAME_CHARS: usize = 40;
 pub fn routes() -> Vec<rocket::Route> {
     routes![
         page,
+        users,
         overview,
         resolve_quarantine,
         set_no_sync,
@@ -38,6 +40,15 @@ pub fn routes() -> Vec<rocket::Route> {
 #[get("/")]
 fn page() -> RawHtml<&'static str> {
     RawHtml(include_str!("web.html"))
+}
+
+#[derive(Serialize)]
+struct UserRow {
+    id: String,
+    /// Names of the MiSTers that sync as this user, to tell the ids apart.
+    devices: Vec<String>,
+    /// When any of them last checked in. None if none has yet.
+    last_seen: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -137,6 +148,44 @@ fn save_row(db: &Database, user_id: &str, save: &SaveFile) -> SaveRow {
 async fn decompressed(path: &PathBuf) -> Option<Vec<u8>> {
     let compressed = tokio::fs::read(path).await.ok()?;
     zlib_decompress(&compressed).ok()
+}
+
+/// Every user the server holds saves for, for the page to offer as a list.
+#[get("/api/users")]
+async fn users(db: &State<Arc<Database>>) -> Result<Json<Vec<UserRow>>, Status> {
+    let mut dir = match tokio::fs::read_dir("user_saves").await {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Json(Vec::new())),
+        Err(_) => return Err(Status::InternalServerError),
+    };
+
+    let mut rows = Vec::new();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let Ok(id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !user_exists(&id) {
+            continue;
+        }
+
+        let mut devices: Vec<DeviceEntry> =
+            database::scan(&db.devices, &format!("{}/", id));
+        let last_seen = devices.iter().map(|d| d.last_seen).max();
+        let mut names: Vec<String> = devices
+            .drain(..)
+            .map(|d| d.name.unwrap_or_else(|| default_device_name(&d.id)))
+            .collect();
+        names.sort();
+
+        rows.push(UserRow {
+            id,
+            devices: names,
+            last_seen,
+        });
+    }
+    rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.id.cmp(&b.id)));
+
+    Ok(Json(rows))
 }
 
 #[get("/api/<user_id>/overview")]
