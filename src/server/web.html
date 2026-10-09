@@ -353,6 +353,9 @@
         selectedKey: "",
         // Counts up so that "5 min ago" moves on without new data.
         clock: 0,
+        // How far the browser's clock runs ahead of the server's, in seconds.
+        // Every time on the page was stamped by the server.
+        skew: 0,
         columns: [
           { key: "core", label: "Core" },
           { key: "name", label: "Save" },
@@ -419,7 +422,7 @@
         ago: function (seconds) {
           void this.clock;
           if (!seconds) return "unknown";
-          var delta = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+          var delta = Math.max(0, Math.floor(Date.now() / 1000) - this.skew - seconds);
           if (delta < 60) return "just now";
           if (delta < 3600) return Math.floor(delta / 60) + " min ago";
           if (delta < 86400) return Math.floor(delta / 3600) + " h ago";
@@ -563,6 +566,12 @@
               return;
             }
             if (!response.ok) throw new Error("HTTP " + response.status);
+            var sent = Date.parse(response.headers.get("Date") || "");
+            if (!isNaN(sent)) {
+              var skew = Math.round((Date.now() - sent) / 1000);
+              // The header is whole seconds, so a second or two is noise.
+              if (Math.abs(skew - self.skew) > 2) self.skew = skew;
+            }
             return response.text().then(function (text) {
               // Most polls bring back what is already on the page.
               if (text !== loadedText) {
