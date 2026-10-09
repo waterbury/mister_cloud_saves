@@ -46,6 +46,11 @@ pub struct DeviceEntry {
     /// Set in the web interface; None shows a name derived from the id.
     pub name: Option<String>,
     pub last_seen: u64,
+    /// When the server began recording which saves this machine holds. Only
+    /// saves that changed after it can be told to be missing from it. 0 for a
+    /// machine that has not checked in since the server learned to.
+    #[serde(default)]
+    pub since: u64,
 }
 
 /// Where the current copy of a save came from.
@@ -69,6 +74,9 @@ pub struct Database {
     pub devices: Tree,
     /// Keyed `<user>/<core>/<name>`.
     pub origins: Tree,
+    /// The hash of the copy each machine last sent or was sent, keyed
+    /// `<user>/<core>/<name>/<device>`.
+    pub held: Tree,
 }
 
 pub fn save_key(user_id: &str, core: &str, name: &str) -> String {
@@ -115,6 +123,7 @@ impl Database {
         let no_sync = db.open_tree("no_sync")?;
         let devices = db.open_tree("devices")?;
         let origins = db.open_tree("origins")?;
+        let held = db.open_tree("held")?;
         Ok(Database {
             db,
             user_saves_tree,
@@ -123,6 +132,7 @@ impl Database {
             no_sync,
             devices,
             origins,
+            held,
         })
     }
 

@@ -4,13 +4,15 @@
 //! grants access to that user's saves, here exactly as on the sync routes.
 //! The page asks for it once and a long-lived cookie remembers it after that.
 
-use rocket::State;
 use rocket::http::{Cookie, CookieJar, Header, SameSite, Status};
-use rocket::response::content::RawHtml;
+use rocket::response::content::{RawHtml, RawJavaScript};
+use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::Json;
+use rocket::{Shutdown, State};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use mister_save_utils::logging::fmt_hash;
 use mister_save_utils::{SaveFile, SaveFileType, log_info, log_warn, zlib_decompress};
@@ -25,6 +27,11 @@ use crate::{
 
 const MAX_DEVICE_NAME_CHARS: usize = 40;
 
+/// A machine that checked in this recently is shown as connected. Machines
+/// hold no connection open; by default each asks every 60 seconds, and this
+/// allows it to miss one.
+const CONNECTED_SECS: u64 = 150;
+
 const SESSION_COOKIE: &str = "mister_cloud_saves_user";
 /// Browsers cap a cookie's life at about 400 days. Every visit starts the
 /// count again, so a browser that is used at all is never asked twice.
@@ -33,10 +40,12 @@ const SESSION_DAYS: i64 = 400;
 pub fn routes() -> Vec<rocket::Route> {
     routes![
         page,
+        alpine,
         login,
         session,
         logout,
         overview,
+        events,
         resolve_quarantine,
         set_no_sync,
         rename_device,
@@ -49,11 +58,31 @@ fn page() -> RawHtml<&'static str> {
     RawHtml(include_str!("web.html"))
 }
 
+#[derive(Responder)]
+struct Script {
+    body: RawJavaScript<&'static str>,
+    cache: Header<'static>,
+}
+
+/// Alpine.js, which the page is written in. It is served from the binary so
+/// the page works on a network with no way out to a CDN.
+#[get("/alpine.min.js")]
+fn alpine() -> Script {
+    Script {
+        body: RawJavaScript(include_str!("alpine.min.js")),
+        cache: Header::new("Cache-Control", "public, max-age=86400"),
+    }
+}
+
 #[derive(Serialize)]
 struct DeviceRow {
     id: String,
     name: String,
     last_seen: u64,
+    connected: bool,
+    /// Saves, as `<core>/<name>`, whose current copy this machine has yet to
+    /// take. None while the server has no record of what the machine holds.
+    behind: Option<Vec<String>>,
 }
 
 /// Hashes go out as hex strings: a u64 doesn't survive a JavaScript number.
@@ -125,6 +154,17 @@ fn device_name(db: &Database, user_id: &str, device_id: &str) -> String {
         .unwrap_or_else(|| default_device_name(device_id))
 }
 
+/// When the file holding the current copy was last written. Saves stored
+/// before origins were recorded have nothing else to date them by.
+fn stored_at(user_id: &str, save: &SaveFile) -> Option<u64> {
+    let folder = folder_for(&save.save_type)?;
+    let modified = std::fs::metadata(head_path(user_id, folder, &save.core, &save.name))
+        .ok()?
+        .modified()
+        .ok()?;
+    modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
 fn save_row(db: &Database, user_id: &str, save: &SaveFile) -> SaveRow {
     let key = database::save_key(user_id, &save.core, &save.name);
     let origin: Option<Origin> = database::get(&db.origins, &key);
@@ -135,12 +175,43 @@ fn save_row(db: &Database, user_id: &str, save: &SaveFile) -> SaveRow {
         save_type: save.save_type.clone(),
         hash: fmt_hash(save.hash),
         modified_index: save.modified_index,
-        updated_at: origin.as_ref().map(|o| o.at),
+        updated_at: origin
+            .as_ref()
+            .map(|o| o.at)
+            .or_else(|| stored_at(user_id, save)),
         updated_by: origin
             .and_then(|o| o.device_id)
             .map(|id| device_name(db, user_id, &id)),
         no_sync: db.no_sync.contains_key(&key).unwrap_or(false),
     }
+}
+
+/// The saves `device` has yet to take the current copy of: those another
+/// machine has changed since the server began recording what this one holds,
+/// or whose copy here it was told to replace, and that it has not been sent.
+/// A copy of its own held for a decision is a conflict, not a save it is
+/// behind on.
+fn behind(db: &Database, user_id: &str, device: &DeviceEntry, saves: &[&SaveFile]) -> Vec<String> {
+    let mut names: Vec<String> = saves
+        .iter()
+        .filter(|save| {
+            let key = database::save_key(user_id, &save.core, &save.name);
+            let device_key =
+                database::device_save_key(user_id, &save.core, &save.name, &device.id);
+
+            let changed_since = database::get::<Origin>(&db.origins, &key)
+                .is_some_and(|origin| origin.at >= device.since);
+            let overridden = db.overrides.contains_key(&device_key).unwrap_or(false);
+
+            (changed_since || overridden)
+                && database::get::<u64>(&db.held, &device_key) != Some(save.hash)
+                && !db.no_sync.contains_key(&key).unwrap_or(false)
+                && !db.quarantine.contains_key(&device_key).unwrap_or(false)
+        })
+        .map(|save| format!("{}/{}", save.core, save.name))
+        .collect();
+    names.sort();
+    names
 }
 
 async fn decompressed(path: &PathBuf) -> Option<Vec<u8>> {
@@ -209,9 +280,18 @@ async fn overview(user_id: &str, db: &State<Arc<Database>>) -> Result<Json<Overv
     let prefix = format!("{}/", user_id);
     let data = db.get_user_save_data(user_id).ok_or(Status::NotFound)?;
 
+    let current: Vec<&SaveFile> = data
+        .game_saves
+        .values()
+        .chain(data.save_states.values())
+        .chain(data.nv_ram.values())
+        .collect();
+
     let mut devices: Vec<DeviceRow> = database::scan::<DeviceEntry>(&db.devices, &prefix)
         .into_iter()
         .map(|d| DeviceRow {
+            connected: now().saturating_sub(d.last_seen) <= CONNECTED_SECS,
+            behind: (d.since != 0).then(|| behind(db, user_id, &d, &current)),
             name: d.name.unwrap_or_else(|| default_device_name(&d.id)),
             id: d.id,
             last_seen: d.last_seen,
@@ -268,11 +348,8 @@ async fn overview(user_id: &str, db: &State<Arc<Database>>) -> Result<Json<Overv
         .collect();
     no_sync.sort_by(|a, b| (&a.core, &a.name).cmp(&(&b.core, &b.name)));
 
-    let mut saves: Vec<SaveRow> = data
-        .game_saves
-        .values()
-        .chain(data.save_states.values())
-        .chain(data.nv_ram.values())
+    let mut saves: Vec<SaveRow> = current
+        .iter()
         .map(|save| save_row(db, user_id, save))
         .collect();
     saves.sort_by(|a, b| (&a.core, &a.name).cmp(&(&b.core, &b.name)));
@@ -284,6 +361,45 @@ async fn overview(user_id: &str, db: &State<Arc<Database>>) -> Result<Json<Overv
         no_sync,
         saves,
     }))
+}
+
+/// Sends a message each time something the overview shows changes for this
+/// user, so an open page reloads it at once instead of at its next poll.
+/// Machines checking in are left out: they would fire it on every sync, so
+/// one coming or going shows at the page's next poll.
+#[get("/api/<user_id>/events")]
+fn events(
+    user_id: &str,
+    db: &State<Arc<Database>>,
+    mut shutdown: Shutdown,
+) -> Result<EventStream![], Status> {
+    if !user_exists(user_id) {
+        return Err(Status::NotFound);
+    }
+
+    let prefix = format!("{}/", user_id);
+    let mut origins = db.origins.watch_prefix(prefix.as_bytes());
+    let mut quarantine = db.quarantine.watch_prefix(prefix.as_bytes());
+    let mut overrides = db.overrides.watch_prefix(prefix.as_bytes());
+    let mut no_sync = db.no_sync.watch_prefix(prefix.as_bytes());
+    let mut held = db.held.watch_prefix(prefix.as_bytes());
+
+    Ok(EventStream! {
+        loop {
+            let change = tokio::select! {
+                change = &mut origins => change,
+                change = &mut quarantine => change,
+                change = &mut overrides => change,
+                change = &mut no_sync => change,
+                change = &mut held => change,
+                _ = &mut shutdown => None,
+            };
+            if change.is_none() {
+                break;
+            }
+            yield Event::data("changed");
+        }
+    })
 }
 
 #[derive(Deserialize)]

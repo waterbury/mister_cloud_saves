@@ -136,15 +136,37 @@ link to download either one first. There are three choices:
 
 The first two cannot be undone, so download a copy first if in doubt.
 
-Any save can be set not to sync from the **All saves** list, conflict or not,
-and resumed from the **Not syncing** list. When syncing resumes, a MiSTer whose
-copy differs from the server's shows up as a conflict rather than being
-overwritten.
+**All saves** lists every save with when it last changed, newest first. Click
+a column heading to sort by core, name or date, and again to reverse it. The
+page keeps itself up to date: a save a MiSTer uploads shows up within a second,
+without reloading. Saves stored before the server recorded changes are dated by
+their file on the server.
+
+Click a save for its details, with buttons to download it or to stop syncing
+it, conflict or not. Syncing is resumed there or from the **Not syncing** list.
+When it resumes, a MiSTer whose copy differs from the server's shows up as a
+conflict rather than being overwritten.
 
 Each MiSTer appears under **MiSTers** as `MiSTer-xxxx` the first time it syncs;
 rename them there so conflicts say "Living room" rather than an id. A MiSTer is
 identified by `/media/fat/cloud_saves/device_id`, which the client creates. If
 you clone an SD card to a second MiSTer, delete that file on the copy.
+
+Beside each one the page shows whether it is connected and how far along it
+is:
+
+- **connected** means it checked in within the last two and a half minutes. A
+  MiSTer holds no connection open; it asks the server every
+  `poll_interval_seconds`, so one set well above the default 60, or to 0, shows
+  as not connected between checks.
+- **in sync**, or **3 saves behind the server**: the number of saves another
+  MiSTer has changed that this one has not downloaded yet. Hover over it for
+  their names. A save stays on the list while its core is running on that
+  MiSTer, since the client leaves a running core's saves alone.
+
+The count starts from a MiSTer's first sync with a server of this version, and
+covers only what the server can see: a change a MiSTer has made and not yet
+uploaded is unknown to it.
 
 ### Upgrading
 

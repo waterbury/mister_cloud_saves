@@ -60,9 +60,9 @@
   @media (max-width: 620px) { .sides { grid-template-columns: 1fr; } }
   .side { border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
   .side h4 { margin: 0 0 6px; font-size: 14px; }
-  .side dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
-  .side dt { color: var(--muted); }
-  .side dd { margin: 0; overflow-wrap: anywhere; }
+  dl.facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+  dl.facts dt { color: var(--muted); }
+  dl.facts dd { margin: 0; overflow-wrap: anywhere; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; }
   button, .button {
     font: inherit; cursor: pointer; border-radius: 6px; padding: 6px 12px;
@@ -72,7 +72,11 @@
   button:hover, .button:hover { border-color: var(--muted); }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
   button.danger { color: var(--danger); }
-  button.link { border: 0; padding: 0; background: none; color: var(--accent); text-decoration: underline; }
+  a.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.save { text-align: left; overflow-wrap: anywhere; }
+  button.sort { border: 0; padding: 0; background: none; color: inherit; font-size: inherit; }
+  button.sort:hover { color: var(--text); }
+  th[aria-sort] button.sort { color: var(--text); font-weight: 600; }
   button:disabled { opacity: 0.5; cursor: default; }
   input[type=text], input[type=search], input[type=password] {
     font: inherit; padding: 6px 10px; border-radius: 6px; width: 100%;
@@ -82,11 +86,13 @@
     display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 4px;
     border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
   }
+  .badge.on { color: var(--accent); border-color: var(--accent); }
+  .behind { color: var(--warn); }
   .note { background: var(--warn-bg); color: var(--warn); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
   .error { color: var(--danger); }
   .table-wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   th { color: var(--muted); font-weight: normal; font-size: 13px; }
   td.name { overflow-wrap: anywhere; min-width: 180px; }
   td.act { white-space: nowrap; text-align: right; }
@@ -94,71 +100,206 @@
   .stamp { display: block; font-size: 12px; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .row .grow { flex: 1 1 200px; }
-  [hidden] { display: none !important; }
+  dialog {
+    width: min(480px, calc(100vw - 32px)); padding: 0; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+  .sheet { padding: 16px; }
+  .sheet h3 { margin: 0 0 12px; font-size: 16px; overflow-wrap: anywhere; }
+  .sheet .actions { margin-top: 16px; }
+  .sheet .last { margin-left: auto; }
+  [hidden], [x-cloak] { display: none !important; }
 </style>
 </head>
 <body>
-<main>
+<main x-data="page" x-cloak>
   <header>
     <h1>MiSTer Cloud Saves</h1>
-    <span id="who" class="muted small" hidden></span>
-    <button id="refresh" hidden>Refresh</button>
-    <button id="logout" hidden>Switch user</button>
+    <span class="muted small" x-show="view === 'app'" x-text="'user ' + userId.slice(0, 8) + '…'"></span>
+    <button x-show="view === 'app'" @click="signOut('', true)">Switch user</button>
   </header>
 
-  <section id="login" class="panel" hidden>
-    <form id="login-form" method="post" action="/">
+  <section class="panel" x-show="view === 'login'">
+    <form method="post" action="/" @submit.prevent="signIn(loginId)">
       <p><label for="user-id">User ID</label></p>
       <!-- A password field with a fixed username beside it, so the browser
            offers to save the user ID and fills it in the next time. -->
       <input class="offscreen" type="text" name="username" autocomplete="username"
              value="MiSTer Cloud Saves" readonly tabindex="-1" aria-hidden="true">
       <div class="row">
-        <input class="grow mono" id="user-id" type="password" name="password"
-               autocomplete="current-password" spellcheck="false" required>
+        <input class="grow mono" id="user-id" type="password" name="password" x-ref="userId"
+               x-model="loginId" autocomplete="current-password" spellcheck="false" required>
         <button class="primary" type="submit">Open</button>
       </div>
       <p class="muted small">It is the <code>user_id</code> line in <code>cloud_saves.ini</code>
         at the root of your MiSTer's SD card. Anyone who has it can manage these saves.
         This browser stays signed in afterwards.</p>
-      <p id="login-error" class="error" hidden></p>
+      <p class="error" x-show="loginError" x-text="loginError"></p>
     </form>
   </section>
 
-  <div id="app" hidden>
-    <p id="status" class="error" hidden></p>
+  <template x-if="view === 'app' && data">
+    <div>
+      <p class="error" x-show="status" x-text="status"></p>
 
-    <section>
-      <h2>Needs a decision <span class="count" id="quarantine-count"></span></h2>
-      <div id="quarantine"></div>
-    </section>
+      <section>
+        <h2>Needs a decision
+          <span class="count" x-show="data.quarantine.length" x-text="'(' + data.quarantine.length + ')'"></span></h2>
+        <div class="panel muted" x-show="!data.quarantine.length">No conflicts. Nothing is waiting on you.</div>
+        <template x-for="q in data.quarantine" :key="saveKey(q) + '/' + q.device_id">
+          <div class="panel conflict">
+            <h3 x-text="q.core + ' / ' + q.name"></h3>
+            <p class="muted small">
+              <span class="badge" x-text="typeLabel(q.save_type)"></span>
+              <span x-text="conflictText(q)"></span>
+            </p>
+            <div class="sides">
+              <template x-if="q.current">
+                <div class="side">
+                  <h4>Current save, on every other MiSTer</h4>
+                  <dl class="facts">
+                    <dt>Last changed</dt>
+                    <dd><span x-text="ago(q.current.updated_at)"></span>
+                      <span class="stamp muted" x-text="exact(q.current.updated_at)"></span></dd>
+                    <dt>By</dt><dd x-text="q.current.updated_by || 'unknown'"></dd>
+                    <dt>Size</dt><dd x-text="size(q.current_size)"></dd>
+                    <dt>Fingerprint</dt><dd class="mono" x-text="q.current.hash"></dd>
+                  </dl>
+                  <p><a class="small" :href="downloadUrl(q)">Download this copy</a></p>
+                </div>
+              </template>
+              <template x-if="!q.current">
+                <div class="side muted">The server has no current copy.</div>
+              </template>
+              <div class="side">
+                <h4 x-text="'Held copy, from ' + q.device_name"></h4>
+                <dl class="facts">
+                  <dt>Last changed</dt>
+                  <dd><span x-text="ago(q.updated_at)"></span>
+                    <span class="stamp muted" x-text="exact(q.updated_at)"></span></dd>
+                  <dt>Conflict began</dt><dd :title="full(q.first_at)" x-text="ago(q.first_at)"></dd>
+                  <dt>Size</dt><dd x-text="size(q.size)"></dd>
+                  <dt>Fingerprint</dt><dd class="mono" x-text="q.hash"></dd>
+                </dl>
+                <p><a class="small" :href="downloadUrl(q, q.device_id)">Download this copy</a></p>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="primary" @click="promote(q)" x-text="'Use ' + q.device_name + '\'s copy everywhere'"></button>
+              <button class="danger" @click="discard(q)">Discard it, keep the current save</button>
+              <button @click="stopSyncing(q)">Stop syncing this save</button>
+            </div>
+          </div>
+        </template>
+      </section>
 
-    <section id="overrides-section" hidden>
-      <h2>Waiting on a MiSTer</h2>
-      <div id="overrides" class="panel"></div>
-    </section>
+      <section x-show="data.overrides.length">
+        <h2>Waiting on a MiSTer</h2>
+        <div class="panel">
+          <template x-for="o in data.overrides" :key="saveKey(o) + '/' + o.device_name">
+            <p><span x-text="o.device_name + ' will replace its copy of ' + o.core + ' / ' + o.name +
+              ' with the current save the next time it syncs (decided '"></span><span
+              :title="full(o.at)" x-text="ago(o.at)"></span>).</p>
+          </template>
+        </div>
+      </section>
 
-    <section id="no-sync-section" hidden>
-      <h2>Not syncing <span class="count" id="no-sync-count"></span></h2>
-      <div class="panel table-wrap"><table><tbody id="no-sync"></tbody></table></div>
-    </section>
+      <section x-show="data.no_sync.length">
+        <h2>Not syncing <span class="count" x-text="'(' + data.no_sync.length + ')'"></span></h2>
+        <div class="panel table-wrap"><table><tbody>
+          <template x-for="n in data.no_sync" :key="saveKey(n)">
+            <tr>
+              <td x-text="n.core"></td>
+              <td class="name" x-text="n.name"></td>
+              <td class="muted" :title="full(n.at)" x-text="'since ' + ago(n.at)"></td>
+              <td class="act"><button @click="resumeSyncing(n)">Resume syncing</button></td>
+            </tr>
+          </template>
+        </tbody></table></div>
+      </section>
 
-    <section>
-      <h2>MiSTers</h2>
-      <div class="panel table-wrap"><table><tbody id="devices"></tbody></table></div>
-    </section>
+      <section>
+        <h2>MiSTers</h2>
+        <div class="panel table-wrap"><table><tbody>
+          <tr x-show="!data.devices.length"><td class="muted">No MiSTer has checked in yet.
+            They appear here once they run a client that supports this page.</td></tr>
+          <template x-for="d in data.devices" :key="d.id">
+            <tr>
+              <td class="name" x-text="d.name"></td>
+              <td>
+                <span class="badge" :class="d.connected ? 'on' : ''" x-text="d.connected ? 'connected' : 'not connected'"></span>
+                <span :class="waiting(d) ? 'behind' : 'muted'" :title="behindList(d)" x-text="syncText(d)"></span>
+              </td>
+              <td class="muted" :title="full(d.last_seen)" x-text="'last seen ' + ago(d.last_seen)"></td>
+              <td class="act"><button @click="rename(d)">Rename</button></td>
+            </tr>
+          </template>
+        </tbody></table></div>
+      </section>
 
-    <section>
-      <h2>All saves <span class="count" id="saves-count"></span></h2>
-      <input id="filter" type="search" placeholder="Filter by core or name">
-      <div class="panel table-wrap">
-        <table>
-          <thead><tr><th>Core</th><th>Save</th><th>Last changed</th><th></th></tr></thead>
-          <tbody id="saves"></tbody>
-        </table>
+      <section>
+        <h2>All saves <span class="count" x-text="'(' + data.saves.length + ')'"></span></h2>
+        <input type="search" placeholder="Filter by core or name" x-model="filter">
+        <div class="panel table-wrap">
+          <table>
+            <thead><tr>
+              <template x-for="column in columns" :key="column.key">
+                <th :aria-sort="sortKey === column.key ? (sortDown ? 'descending' : 'ascending') : null">
+                  <button class="sort" @click="sortBy(column.key)"
+                          x-text="column.label + (sortKey === column.key ? (sortDown ? ' ▼' : ' ▲') : '')"></button>
+                </th>
+              </template>
+            </tr></thead>
+            <tbody>
+              <template x-for="s in shownSaves" :key="saveKey(s)">
+                <tr>
+                  <td x-text="s.core"></td>
+                  <td class="name">
+                    <button class="save" @click="openSave(s)" x-text="s.name"></button>
+                    <span class="badge" x-show="s.save_type !== 'GameSave'" x-text="typeLabel(s.save_type)"></span>
+                    <span class="badge" x-show="s.no_sync">not syncing</span>
+                  </td>
+                  <td class="muted">
+                    <span x-text="s.updated_at ? ago(s.updated_at) + (s.updated_by ? ' by ' + s.updated_by : '') : ''"></span>
+                    <span class="stamp" x-text="s.updated_at ? exact(s.updated_at) : ''"></span>
+                  </td>
+                </tr>
+              </template>
+              <tr x-show="matchingSaves.length > shownSaves.length"><td colspan="3" class="muted"
+                x-text="'Showing the first ' + shownSaves.length + ' of ' + matchingSaves.length + '. Filter to narrow it down.'"></td></tr>
+              <tr x-show="!matchingSaves.length"><td colspan="3" class="muted"
+                x-text="data.saves.length ? 'Nothing matches.' : 'No saves on the server yet.'"></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </template>
+
+  <!-- Clicking outside the sheet lands on the dialog itself and closes it. -->
+  <dialog x-ref="saveDialog" @close="selectedKey = ''" @click.self="closeSave()">
+    <template x-if="selected">
+      <div class="sheet">
+        <h3 x-text="selected.name"></h3>
+        <dl class="facts">
+          <dt>Core</dt><dd x-text="selected.core"></dd>
+          <dt>Kind</dt><dd x-text="typeLabel(selected.save_type)"></dd>
+          <dt>Last changed</dt>
+          <dd><span x-text="ago(selected.updated_at) + (selected.updated_by ? ' by ' + selected.updated_by : '')"></span>
+            <span class="stamp muted" x-text="exact(selected.updated_at)"></span></dd>
+          <dt>Fingerprint</dt><dd class="mono" x-text="selected.hash"></dd>
+          <dt>Syncing</dt><dd x-text="selected.no_sync ? 'No, every MiSTer keeps its own copy' : 'Yes'"></dd>
+        </dl>
+        <div class="actions">
+          <a class="button primary" :href="downloadUrl(selected)" download>Download</a>
+          <button class="danger" x-show="!selected.no_sync" @click="stopSyncing(selected)">Stop syncing</button>
+          <button x-show="selected.no_sync" @click="resumeSyncing(selected)">Resume syncing</button>
+          <button class="last" @click="closeSave()">Close</button>
+        </div>
       </div>
-    </section>
-  </div>
+    </template>
+  </dialog>
 </main>
 
 <script>
@@ -166,31 +307,19 @@
   "use strict";
 
   var STORAGE_KEY = "mister_cloud_saves_user";
+  // The server announces changes as they happen; the poll is for what it
+  // does not announce, and for a proxy that holds the announcements back.
   var REFRESH_MS = 20000;
+  var RELOAD_DELAY_MS = 250;
   var MAX_ROWS = 300;
 
-  var userId = "";
-  var data = null;
-  var busy = false;
+  var names = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+  // Kept out of the page's data: Alpine has no business watching them.
   var timer = null;
-
-  function $(id) { return document.getElementById(id); }
-
-  // Everything shown comes from save and device names, so it is only ever
-  // added as text nodes.
-  function el(tag, props, children) {
-    var node = document.createElement(tag);
-    Object.keys(props || {}).forEach(function (key) {
-      if (key === "class") node.className = props[key];
-      else if (key === "onclick") node.addEventListener("click", props[key]);
-      else node.setAttribute(key, props[key]);
-    });
-    (children || []).forEach(function (child) {
-      if (child === null || child === undefined) return;
-      node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
-    });
-    return node;
-  }
+  var reloadTimer = null;
+  var events = null;
+  var loadedText = "";
 
   // Earlier versions of the page kept the user ID in the address and in
   // localStorage. One found there is signed in with once, then cleared: the
@@ -206,334 +335,331 @@
     return id;
   }
 
-  function ago(seconds) {
-    if (!seconds) return "unknown";
-    var delta = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
-    if (delta < 60) return "just now";
-    if (delta < 3600) return Math.floor(delta / 60) + " min ago";
-    if (delta < 86400) return Math.floor(delta / 3600) + " h ago";
-    return Math.floor(delta / 86400) + " d ago";
-  }
+  // Everything shown comes from save and device names, so the page only ever
+  // binds it with x-text and attributes, never as HTML.
+  document.addEventListener("alpine:init", function () {
+    Alpine.data("page", function () {
+      return {
+        view: "",
+        userId: "",
+        loginId: "",
+        loginError: "",
+        status: "",
+        data: null,
+        busy: false,
+        filter: "",
+        sortKey: "updated_at",
+        sortDown: true,
+        selectedKey: "",
+        // Counts up so that "5 min ago" moves on without new data.
+        clock: 0,
+        columns: [
+          { key: "core", label: "Core" },
+          { key: "name", label: "Save" },
+          { key: "updated_at", label: "Last changed" }
+        ],
 
-  function when(seconds) {
-    if (!seconds) return el("span", {}, ["unknown"]);
-    return el("span", { title: new Date(seconds * 1000).toLocaleString() }, [ago(seconds)]);
-  }
+        init: function () {
+          var self = this;
+          setInterval(function () { self.clock++; }, 30000);
 
-  // The relative time, and under it the date and time in the browser's
-  // time zone, named.
-  function stamped(seconds, by) {
-    if (!seconds) return el("span", {}, ["unknown"]);
-    var exact = new Date(seconds * 1000).toLocaleString(undefined, {
-      year: "numeric", month: "short", day: "numeric",
-      hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short"
-    });
-    return el("span", {}, [
-      ago(seconds) + (by ? " by " + by : ""),
-      el("span", { class: "stamp muted" }, [exact])
-    ]);
-  }
+          var carried = carriedOver();
+          if (carried) {
+            this.signIn(carried);
+            return;
+          }
+          fetch("/api/session").then(function (response) {
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            return response.json();
+          }).then(function (id) {
+            if (id) self.open(id);
+            else self.showLogin("");
+          }).catch(function () {
+            self.showLogin("Could not reach the server.");
+          });
+        },
 
-  function size(bytes) {
-    if (bytes === null || bytes === undefined) return "unknown";
-    if (bytes < 1024) return bytes + " bytes";
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
-    return (bytes / 1048576).toFixed(1) + " MB";
-  }
+        get matchingSaves() {
+          var needle = this.filter.trim().toLowerCase();
+          var key = this.sortKey;
+          var rows = this.data.saves.filter(function (s) {
+            return !needle || (s.core + " " + s.name).toLowerCase().indexOf(needle) !== -1;
+          });
+          rows.sort(function (a, b) {
+            var byCore = names.compare(a.core, b.core);
+            var byName = names.compare(a.name, b.name);
+            if (key === "updated_at") return (a.updated_at || 0) - (b.updated_at || 0) || -byCore || -byName;
+            return key === "name" ? byName || byCore : byCore || byName;
+          });
+          return this.sortDown ? rows.reverse() : rows;
+        },
 
-  function typeLabel(type) {
-    return { GameSave: "save", SaveState: "save state", NvRam: "nvram" }[type] || type;
-  }
+        get shownSaves() {
+          return this.matchingSaves.slice(0, MAX_ROWS);
+        },
 
-  function api(path, body) {
-    var options = body === undefined ? {} : {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    };
-    return fetch("/api/" + encodeURIComponent(userId) + path, options);
-  }
+        get selected() {
+          var key = this.selectedKey;
+          var self = this;
+          if (!key || !this.data) return null;
+          return this.data.saves.find(function (s) { return self.saveKey(s) === key; }) || null;
+        },
 
-  function downloadUrl(save, deviceId) {
-    var url = "/api/" + encodeURIComponent(userId) + "/download?core=" +
-      encodeURIComponent(save.core) + "&name=" + encodeURIComponent(save.name);
-    return deviceId ? url + "&device=" + encodeURIComponent(deviceId) : url;
-  }
+        saveKey: function (save) { return save.core + "/" + save.name; },
 
-  function showStatus(message) {
-    $("status").textContent = message || "";
-    $("status").hidden = !message;
-  }
+        // Dates start newest first, names from A.
+        sortBy: function (key) {
+          if (this.sortKey === key) this.sortDown = !this.sortDown;
+          else {
+            this.sortKey = key;
+            this.sortDown = key === "updated_at";
+          }
+        },
 
-  function act(path, body, question) {
-    if (busy || (question && !confirm(question))) return;
-    busy = true;
-    api(path, body).then(function (response) {
-      busy = false;
-      showStatus(response.ok ? "" : "That did not go through (HTTP " + response.status + ").");
-      return load();
-    }).catch(function () {
-      busy = false;
-      showStatus("Could not reach the server.");
-    });
-  }
+        ago: function (seconds) {
+          void this.clock;
+          if (!seconds) return "unknown";
+          var delta = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+          if (delta < 60) return "just now";
+          if (delta < 3600) return Math.floor(delta / 60) + " min ago";
+          if (delta < 86400) return Math.floor(delta / 3600) + " h ago";
+          return Math.floor(delta / 86400) + " d ago";
+        },
 
-  function stopSyncing(save) {
-    act("/no_sync",
-      { core: save.core, name: save.name, save_type: save.save_type, enabled: true },
-      "Stop syncing " + save.core + " / " + save.name + "?\n\n" +
-      "No MiSTer will upload or download it from now on. Each keeps the copy it has. " +
-      "Any copy of it held here for a decision is deleted from the server.");
-  }
+        full: function (seconds) {
+          return seconds ? new Date(seconds * 1000).toLocaleString() : "";
+        },
 
-  function field(label, value) {
-    return [el("dt", {}, [label]), el("dd", {}, [value])];
-  }
+        // The date and time in the browser's time zone, named.
+        exact: function (seconds) {
+          if (!seconds) return "";
+          return new Date(seconds * 1000).toLocaleString(undefined, {
+            year: "numeric", month: "short", day: "numeric",
+            hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short"
+          });
+        },
 
-  function side(title, rows, href) {
-    var list = el("dl", {}, []);
-    rows.forEach(function (pair) {
-      pair.forEach(function (node) { list.appendChild(node); });
-    });
-    return el("div", { class: "side" }, [
-      el("h4", {}, [title]),
-      list,
-      el("p", {}, [el("a", { href: href, class: "small" }, ["Download this copy"])])
-    ]);
-  }
+        size: function (bytes) {
+          if (bytes === null || bytes === undefined) return "unknown";
+          if (bytes < 1024) return bytes + " bytes";
+          if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+          return (bytes / 1048576).toFixed(1) + " MB";
+        },
 
-  function conflictCard(q) {
-    var who = q.device_name;
-    var sameSize = q.current_size !== null && q.current_size === q.size;
+        typeLabel: function (type) {
+          return { GameSave: "save", SaveState: "save state", NvRam: "nvram" }[type] || type;
+        },
 
-    var current = q.current ? side("Current save, on every other MiSTer", [
-      field("Last changed", stamped(q.current.updated_at)),
-      field("By", q.current.updated_by || "unknown"),
-      field("Size", size(q.current_size)),
-      field("Fingerprint", el("span", { class: "mono" }, [q.current.hash]))
-    ], downloadUrl(q)) : el("div", { class: "side muted" }, ["The server has no current copy."]);
+        // Saves the server is waiting to hand this MiSTer.
+        waiting: function (device) {
+          return device.behind ? device.behind.length : 0;
+        },
 
-    var held = side("Held copy, from " + who, [
-      field("Last changed", stamped(q.updated_at)),
-      field("Conflict began", when(q.first_at)),
-      field("Size", size(q.size)),
-      field("Fingerprint", el("span", { class: "mono" }, [q.hash]))
-    ], downloadUrl(q, q.device_id));
+        // What the server can tell: it never sees a change a MiSTer has made
+        // and not yet sent.
+        syncText: function (device) {
+          var count = this.waiting(device);
+          var held = this.data.quarantine.filter(function (q) { return q.device_id === device.id; }).length;
+          var text = device.behind === null ? "" : count
+            ? count + (count === 1 ? " save" : " saves") + " behind the server"
+            : device.connected ? "in sync" : "nothing waiting for it";
+          if (held) text += (text ? ", " : "") + held + (held === 1 ? " conflict" : " conflicts");
+          return text;
+        },
 
-    return el("div", { class: "panel conflict" }, [
-      el("h3", {}, [q.core + " / " + q.name]),
-      el("p", { class: "muted small" }, [
-        el("span", { class: "badge" }, [typeLabel(q.save_type)]),
-        " " + who + " changed this save without having the current one first. " +
-        "Its copy is held here and nothing has changed on any MiSTer. " + who +
-        " keeps playing on its own copy until you decide." +
-        (sameSize ? "" : " The two copies differ in size.")
-      ]),
-      el("div", { class: "sides" }, [current, held]),
-      el("div", { class: "actions" }, [
-        el("button", { class: "primary", onclick: function () {
-          act("/quarantine/promote", { core: q.core, name: q.name, device_id: q.device_id },
-            "Use " + who + "'s copy of " + q.core + " / " + q.name + " everywhere?\n\n" +
+        behindList: function (device) {
+          var names = device.behind || [];
+          var shown = names.slice(0, 20).join("\n");
+          return names.length > 20 ? shown + "\nand " + (names.length - 20) + " more" : shown;
+        },
+
+        conflictText: function (q) {
+          var sameSize = q.current_size !== null && q.current_size === q.size;
+          return q.device_name + " changed this save without having the current one first. " +
+            "Its copy is held here and nothing has changed on any MiSTer. " + q.device_name +
+            " keeps playing on its own copy until you decide." +
+            (sameSize ? "" : " The two copies differ in size.");
+        },
+
+        api: function (path, body) {
+          var options = body === undefined ? {} : {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+          };
+          return fetch("/api/" + encodeURIComponent(this.userId) + path, options);
+        },
+
+        downloadUrl: function (save, deviceId) {
+          var url = "/api/" + encodeURIComponent(this.userId) + "/download?core=" +
+            encodeURIComponent(save.core) + "&name=" + encodeURIComponent(save.name);
+          return deviceId ? url + "&device=" + encodeURIComponent(deviceId) : url;
+        },
+
+        act: function (path, body, question) {
+          var self = this;
+          if (this.busy || (question && !confirm(question))) return;
+          this.busy = true;
+          this.api(path, body).then(function (response) {
+            self.busy = false;
+            self.status = response.ok ? "" : "That did not go through (HTTP " + response.status + ").";
+            return self.load();
+          }).catch(function () {
+            self.busy = false;
+            self.status = "Could not reach the server.";
+          });
+        },
+
+        promote: function (q) {
+          this.act("/quarantine/promote", { core: q.core, name: q.name, device_id: q.device_id },
+            "Use " + q.device_name + "'s copy of " + q.core + " / " + q.name + " everywhere?\n\n" +
             "It becomes the current save and every other MiSTer downloads it, " +
             "replacing the current one. This cannot be undone.");
-        } }, ["Use " + who + "'s copy everywhere"]),
-        el("button", { class: "danger", onclick: function () {
-          act("/quarantine/discard", { core: q.core, name: q.name, device_id: q.device_id },
-            "Discard " + who + "'s copy of " + q.core + " / " + q.name + "?\n\n" +
-            "The held copy is deleted, and " + who + " replaces whatever it has for this " +
+        },
+
+        discard: function (q) {
+          this.act("/quarantine/discard", { core: q.core, name: q.name, device_id: q.device_id },
+            "Discard " + q.device_name + "'s copy of " + q.core + " / " + q.name + "?\n\n" +
+            "The held copy is deleted, and " + q.device_name + " replaces whatever it has for this " +
             "save with the current one the next time it syncs, including anything it " +
             "saved in the meantime. This cannot be undone.");
-        } }, ["Discard it, keep the current save"]),
-        el("button", { onclick: function () { stopSyncing(q); } }, ["Stop syncing this save"])
-      ])
-    ]);
-  }
+        },
 
-  function render() {
-    var box = $("quarantine");
-    box.replaceChildren();
-    $("quarantine-count").textContent = data.quarantine.length ? "(" + data.quarantine.length + ")" : "";
-    document.title = (data.quarantine.length ? "(" + data.quarantine.length + ") " : "") + "MiSTer Cloud Saves";
-    if (!data.quarantine.length) {
-      box.appendChild(el("div", { class: "panel muted" }, ["No conflicts. Nothing is waiting on you."]));
-    }
-    data.quarantine.forEach(function (q) { box.appendChild(conflictCard(q)); });
+        stopSyncing: function (save) {
+          this.act("/no_sync",
+            { core: save.core, name: save.name, save_type: save.save_type, enabled: true },
+            "Stop syncing " + save.core + " / " + save.name + "?\n\n" +
+            "No MiSTer will upload or download it from now on. Each keeps the copy it has. " +
+            "Any copy of it held here for a decision is deleted from the server.");
+        },
 
-    $("overrides-section").hidden = !data.overrides.length;
-    $("overrides").replaceChildren.apply($("overrides"), data.overrides.map(function (o) {
-      return el("p", {}, [
-        o.device_name + " will replace its copy of " + o.core + " / " + o.name +
-        " with the current save the next time it syncs (decided ", when(o.at), ")."
-      ]);
-    }));
-
-    $("no-sync-section").hidden = !data.no_sync.length;
-    $("no-sync-count").textContent = "(" + data.no_sync.length + ")";
-    $("no-sync").replaceChildren.apply($("no-sync"), data.no_sync.map(function (n) {
-      return el("tr", {}, [
-        el("td", {}, [n.core]),
-        el("td", { class: "name" }, [n.name]),
-        el("td", { class: "muted" }, ["since ", when(n.at)]),
-        el("td", { class: "act" }, [el("button", { onclick: function () {
-          act("/no_sync", { core: n.core, name: n.name, save_type: n.save_type, enabled: false },
-            "Resume syncing " + n.core + " / " + n.name + "?\n\n" +
+        resumeSyncing: function (save) {
+          this.act("/no_sync",
+            { core: save.core, name: save.name, save_type: save.save_type, enabled: false },
+            "Resume syncing " + save.core + " / " + save.name + "?\n\n" +
             "A MiSTer whose copy differs from the server's will show up under " +
             "\"Needs a decision\" rather than being overwritten.");
-        } }, ["Resume syncing"])])
-      ]);
-    }));
+        },
 
-    var devices = $("devices");
-    devices.replaceChildren();
-    if (!data.devices.length) {
-      devices.appendChild(el("tr", {}, [el("td", { class: "muted" }, [
-        "No MiSTer has checked in yet. They appear here once they run a client that supports this page."
-      ])]));
-    }
-    data.devices.forEach(function (d) {
-      devices.appendChild(el("tr", {}, [
-        el("td", { class: "name" }, [d.name]),
-        el("td", { class: "muted" }, ["last seen ", when(d.last_seen)]),
-        el("td", { class: "act" }, [el("button", { onclick: function () {
-          var name = prompt("Name for this MiSTer", d.name);
-          if (name !== null) act("/device", { device_id: d.id, name: name });
-        } }, ["Rename"])])
-      ]));
+        rename: function (device) {
+          var name = prompt("Name for this MiSTer", device.name);
+          if (name !== null) this.act("/device", { device_id: device.id, name: name });
+        },
+
+        openSave: function (save) {
+          this.selectedKey = this.saveKey(save);
+          this.$refs.saveDialog.showModal();
+        },
+
+        closeSave: function () {
+          this.$refs.saveDialog.close();
+        },
+
+        load: function () {
+          var self = this;
+          return this.api("/overview").then(function (response) {
+            if (response.status === 404) {
+              self.signOut("The server no longer knows that user ID.", true);
+              return;
+            }
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            return response.text().then(function (text) {
+              // Most polls bring back what is already on the page.
+              if (text !== loadedText) {
+                self.data = JSON.parse(text);
+                loadedText = text;
+              }
+              self.status = "";
+              self.view = "app";
+              var waiting = self.data.quarantine.length;
+              document.title = (waiting ? "(" + waiting + ") " : "") + "MiSTer Cloud Saves";
+              if (self.selectedKey && !self.selected) self.closeSave();
+            });
+          }).catch(function () {
+            if (self.data) self.status = "Could not reach the server. Showing what was loaded last.";
+            else self.showLogin("Could not reach the server.");
+          });
+        },
+
+        // Several changes at once, such as a MiSTer uploading a batch, become
+        // one reload.
+        loadSoon: function () {
+          var self = this;
+          clearTimeout(reloadTimer);
+          reloadTimer = setTimeout(function () {
+            if (!self.busy && self.userId) self.load();
+          }, RELOAD_DELAY_MS);
+        },
+
+        open: function (id) {
+          var self = this;
+          this.userId = id;
+          this.loginId = "";
+          this.load();
+
+          this.stopWatching();
+          timer = setInterval(function () {
+            if (!document.hidden && !self.busy && self.userId) self.load();
+          }, REFRESH_MS);
+          if (window.EventSource) {
+            events = new EventSource("/api/" + encodeURIComponent(id) + "/events");
+            events.onmessage = function () { self.loadSoon(); };
+            // The browser reconnects by itself; changes may have gone by
+            // while it was away.
+            events.onopen = function () { self.loadSoon(); };
+          }
+        },
+
+        stopWatching: function () {
+          clearInterval(timer);
+          clearTimeout(reloadTimer);
+          if (events) events.close();
+          events = null;
+        },
+
+        showLogin: function (message) {
+          var self = this;
+          this.view = "login";
+          this.loginError = message || "";
+          this.$nextTick(function () { self.$refs.userId.focus(); });
+        },
+
+        // The server checks the ID and sets the cookie that keeps this
+        // browser signed in.
+        signIn: function (id) {
+          var self = this;
+          id = id.trim();
+          if (!id) return;
+          fetch("/api/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user_id: id })
+          }).then(function (response) {
+            if (response.ok) self.open(id);
+            else if (response.status === 404) self.showLogin("The server does not know that user ID.");
+            else self.showLogin("That did not go through (HTTP " + response.status + ").");
+          }).catch(function () {
+            self.showLogin("Could not reach the server.");
+          });
+        },
+
+        // `forget` also drops the cookie; without it the browser is only
+        // shown the form again.
+        signOut: function (message, forget) {
+          this.stopWatching();
+          if (this.$refs.saveDialog.open) this.closeSave();
+          this.userId = "";
+          this.data = null;
+          loadedText = "";
+          document.title = "MiSTer Cloud Saves";
+          if (forget) fetch("/api/logout", { method: "POST" }).catch(function () {});
+          this.showLogin(message);
+        }
+      };
     });
-
-    renderSaves();
-  }
-
-  function renderSaves() {
-    var needle = $("filter").value.trim().toLowerCase();
-    var rows = data.saves.filter(function (s) {
-      return !needle || (s.core + " " + s.name).toLowerCase().indexOf(needle) !== -1;
-    });
-    $("saves-count").textContent = "(" + data.saves.length + ")";
-
-    var body = $("saves");
-    body.replaceChildren();
-    rows.slice(0, MAX_ROWS).forEach(function (s) {
-      body.appendChild(el("tr", {}, [
-        el("td", {}, [s.core]),
-        el("td", { class: "name" }, [
-          el("a", { href: downloadUrl(s) }, [s.name]),
-          s.save_type === "GameSave" ? null : " ",
-          s.save_type === "GameSave" ? null : el("span", { class: "badge" }, [typeLabel(s.save_type)])
-        ]),
-        el("td", { class: "muted" }, s.updated_at
-          ? [stamped(s.updated_at, s.updated_by)]
-          : [""]),
-        el("td", { class: "act" }, [s.no_sync
-          ? el("span", { class: "badge" }, ["not syncing"])
-          : el("button", { onclick: function () { stopSyncing(s); } }, ["Stop syncing"])])
-      ]));
-    });
-    if (rows.length > MAX_ROWS) {
-      body.appendChild(el("tr", {}, [el("td", { colspan: "4", class: "muted" }, [
-        "Showing the first " + MAX_ROWS + " of " + rows.length + ". Filter to narrow it down."
-      ])]));
-    }
-    if (!rows.length) {
-      body.appendChild(el("tr", {}, [el("td", { colspan: "4", class: "muted" }, [
-        data.saves.length ? "Nothing matches." : "No saves on the server yet."
-      ])]));
-    }
-  }
-
-  function load() {
-    return api("/overview").then(function (response) {
-      if (response.status === 404) {
-        signOut("The server no longer knows that user ID.", true);
-        return;
-      }
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      return response.json().then(function (json) {
-        data = json;
-        showStatus("");
-        $("login").hidden = true;
-        $("app").hidden = false;
-        $("refresh").hidden = false;
-        $("logout").hidden = false;
-        $("who").hidden = false;
-        $("who").textContent = "user " + userId.slice(0, 8) + "…";
-        render();
-      });
-    }).catch(function () {
-      if (data) showStatus("Could not reach the server. Showing what was loaded last.");
-      else showLogin("Could not reach the server.");
-    });
-  }
-
-  function open(id) {
-    userId = id;
-    $("user-id").value = "";
-    load();
-    clearInterval(timer);
-    timer = setInterval(function () {
-      if (!document.hidden && !busy && userId) load();
-    }, REFRESH_MS);
-  }
-
-  function showLogin(message) {
-    ["app", "refresh", "logout", "who"].forEach(function (id) { $(id).hidden = true; });
-    $("login").hidden = false;
-    $("login-error").textContent = message || "";
-    $("login-error").hidden = !message;
-    $("user-id").focus();
-  }
-
-  // The server checks the ID and sets the cookie that keeps this browser
-  // signed in.
-  function signIn(id) {
-    id = id.trim();
-    if (!id) return;
-    fetch("/api/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: id })
-    }).then(function (response) {
-      if (response.ok) open(id);
-      else if (response.status === 404) showLogin("The server does not know that user ID.");
-      else showLogin("That did not go through (HTTP " + response.status + ").");
-    }).catch(function () {
-      showLogin("Could not reach the server.");
-    });
-  }
-
-  // `forget` also drops the cookie; without it the browser is only shown the
-  // form again.
-  function signOut(message, forget) {
-    clearInterval(timer);
-    userId = "";
-    data = null;
-    if (forget) fetch("/api/logout", { method: "POST" }).catch(function () {});
-    showLogin(message);
-  }
-
-  $("login-form").addEventListener("submit", function (event) {
-    event.preventDefault();
-    signIn($("user-id").value);
   });
-  $("logout").addEventListener("click", function () { signOut("", true); });
-  $("refresh").addEventListener("click", function () { load(); });
-  $("filter").addEventListener("input", function () { if (data) renderSaves(); });
-
-  var carried = carriedOver();
-  if (carried) {
-    signIn(carried);
-  } else {
-    fetch("/api/session").then(function (response) {
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      return response.json();
-    }).then(function (id) {
-      if (id) open(id);
-      else showLogin("");
-    }).catch(function () {
-      showLogin("Could not reach the server.");
-    });
-  }
 })();
 </script>
+<script defer src="/alpine.min.js"></script>
 </body>
 </html>

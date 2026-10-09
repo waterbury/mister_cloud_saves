@@ -149,9 +149,24 @@ fn note_device(db: &Database, user_id: &str, device: &Option<Device>) {
         id: id.clone(),
         name: None,
         last_seen: 0,
+        since: 0,
     });
     entry.last_seen = now();
+    if entry.since == 0 {
+        entry.since = entry.last_seen;
+    }
     database::put(&db.devices, &key, &entry);
+}
+
+/// Records that a machine has the copy of a save with this hash, because it
+/// sent it or was sent it. The web page counts the saves a machine is behind
+/// on from these.
+fn note_held(db: &Database, user_id: &str, core: &str, name: &str, device_id: &str, hash: u64) {
+    database::put(
+        &db.held,
+        &database::device_save_key(user_id, core, name, device_id),
+        &hash,
+    );
 }
 
 /// Drops whatever the server holds apart for one machine's copy of a save:
@@ -232,6 +247,9 @@ async fn store_current(
             at: now(),
         },
     );
+    if let Some(id) = device_id {
+        note_held(db, user_id, &save.core, &save.name, id, save.hash);
+    }
 
     Status::Ok
 }
@@ -331,6 +349,7 @@ async fn upload_save(
                 match db.set_user_save_data(user_id, &_save_file) {
                     Some(true) => {
                         if let Some(id) = device_id {
+                            note_held(db, user_id, &_save_file.core, &_save_file.name, id, _save_file.hash);
                             clear_device_state(db, user_id, &_save_file, id).await;
                         }
                         Status::Ok
@@ -559,6 +578,7 @@ async fn upload_save(
 #[post("/fetch_save", data = "<save_request>")]
 async fn fetch_save(
     save_request: Json<FetchSaveRequest>,
+    device: Option<Device>,
     db: &State<Arc<Database>>,
 ) -> Result<NamedFile, NotFound<String>> {
     let save_key = format!("{}/{}", &save_request.core, &save_request.name);
@@ -632,6 +652,17 @@ async fn fetch_save(
                 fmt_index_opt(entry.as_ref().map(|e| e.modified_index)),
                 save_request.modified_index
             );
+
+            if let (Some(Device(id)), Some(entry)) = (&device, entry.as_ref()) {
+                note_held(
+                    db,
+                    &save_request.user_id,
+                    &entry.core,
+                    &entry.name,
+                    id,
+                    entry.hash,
+                );
+            }
 
             if let (Some(stored), Some(entry)) = (stored_hash, entry.as_ref()) {
                 if !hashes_equal(stored, entry.hash) {
@@ -970,7 +1001,7 @@ mod tests {
 
         let db = Arc::new(Database::new("user_saves_sled").unwrap());
         let figment = Figment::from(rocket::Config::debug_default());
-        let client = Client::tracked(build(figment, db)).await.unwrap();
+        let client = Client::tracked(build(figment, db.clone())).await.unwrap();
         let user = client
             .get("/generate_user_id")
             .dispatch()
@@ -1068,6 +1099,40 @@ mod tests {
         assert_eq!(t.upload(None, "old1", None, index).await, 409);
         assert_eq!(t.upload(None, "old1", None, index + 1).await, 200);
 
+        // Neither machine has that copy yet. One is no longer behind once it
+        // has been sent it.
+        let behind = |overview: &serde_json::Value, id: &str| {
+            let devices = overview["devices"].as_array().unwrap();
+            let device = devices.iter().find(|d| d["id"] == id).unwrap();
+            assert_eq!(device["connected"], true);
+            device["behind"].as_array().unwrap().len()
+        };
+        let overview = t.overview().await;
+        assert_eq!((behind(&overview, "dev-a"), behind(&overview, "dev-b")), (1, 1));
+        let fetched = t
+            .client
+            .post("/fetch_save")
+            .header(ContentType::JSON)
+            .header(Header::new(DEVICE_ID_HEADER, "dev-a"))
+            .body(
+                serde_json::json!({
+                    "user_id": t.user, "core": "Genesis", "name": "Sonic.sav",
+                    "save_type": "GameSave", "modified_index": index + 1
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await
+            .status()
+            .code;
+        assert_eq!(fetched, 200);
+        let overview = t.overview().await;
+        assert_eq!((behind(&overview, "dev-a"), behind(&overview, "dev-b")), (0, 1));
+        // The machine a save came from is not behind on it.
+        assert_eq!(t.upload(Some("dev-b"), "b5", Some("old1"), index + 2).await, 200);
+        let overview = t.overview().await;
+        assert_eq!((behind(&overview, "dev-a"), behind(&overview, "dev-b")), (1, 0));
+
         // Names that would escape the user's directory are refused.
         let escape = SaveFile {
             name: "..".to_string(),
@@ -1097,6 +1162,16 @@ mod tests {
                 .any(|d| d["name"] == "Den")
         );
         assert!(t.client.get("/").dispatch().await.into_string().await.unwrap().contains("<title>"));
+        assert_eq!(
+            t.client.get("/alpine.min.js").dispatch().await.content_type(),
+            Some(ContentType::JavaScript)
+        );
+        assert_eq!(t.client.get("/api/no-such-user/events").dispatch().await.status().code, 404);
+
+        // A save stored before origins were recorded is dated by its file.
+        database::remove(&db.origins, &database::save_key(&t.user, "Genesis", "Sonic.sav"));
+        let overview = t.overview().await;
+        assert!(overview["saves"][0]["updated_at"].as_u64().unwrap() + 60 > now());
 
         {
             // The page's login: a known user id is remembered by cookie, which
